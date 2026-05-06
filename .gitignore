@@ -1,0 +1,6 @@
+/opendata
+/stgcn_data
+*.png
+/mds
+/architectures
+.*pdf

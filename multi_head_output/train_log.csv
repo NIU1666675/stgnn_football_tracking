@@ -1,0 +1,1 @@
+epoch,lr,train_total,train_event,train_time,train_pause,train_state,train_event_acc,train_pause_acc,train_time_mae_s,train_state_err_m,val_total,val_event,val_time,val_pause,val_state,val_event_acc,val_pause_acc,val_time_mae_s,val_state_err_m
