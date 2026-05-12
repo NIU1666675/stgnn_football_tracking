@@ -26,8 +26,11 @@ import torch.nn.functional as F
 from .constants import (
     D_MODEL,
     DROPOUT,
+    FPS,
     N_NODES,
     N_PHASE_CLASSES,
+    STRIDE,
+    T_PRED_MAX,
 )
 
 
@@ -124,19 +127,31 @@ class PauseHead(nn.Module):
         return self.mlp(self.norm(h_cond)).squeeze(-1)   # [B]
 
 
-# ── 5. StateHead ────────────────────────────────────────────────────────────
+# ── 5. TrajectoryHead ───────────────────────────────────────────────────────
 
-class StateHead(nn.Module):
+# Pas temporal entre frames predits = stride/FPS (s'agafa de constants.py).
+PRED_STEP_S = STRIDE / FPS                # 0.3 s a stride=3 i FPS=10
+
+
+class TrajectoryHead(nn.Module):
     """
-    Prediu, per cada node, el desplaçament (Δx, Δy) des de la seva posició al
-    frame de predicció fins a la posició al frame de l'event. La posició final
-    és:
-        state_final[b, n] = current_pos[b, n] + Δpos[b, n]
+    Prediu, per cada node v i cada step k ∈ {1, ..., T_PRED_MAX}, la posició
+    (x, y) corresponent al moment t + k · PRED_STEP_S segons.
 
-    Per cada node concatenem:
-        - h_cond (global)        [d_in]
-        - posició actual (x, y)  [2]
-        - Δt (segons)            [1]
+    Internament aprèn el **desplaçament** Δpos respecte a current_pos:
+        traj_pred[b, k, n] = current_pos[b, n] + MLP(...)
+
+    La MLP és **compartida** entre tots els steps i nodes; el que canvia és
+    el seu input. Per cada (b, k, n) rep:
+
+        [h_cond[b], current_pos[b,n], dt_k[k], delta_t[b]]
+            ↑              ↑              ↑          ↑
+       context global   posició a t   "edat" del   horitzó total
+                                       step k       fins next.frame_start
+
+    Forma de la sortida: [B, T_PRED_MAX, N, 2]   (posicions absolutes).
+    Els steps que cauen més enllà de Δt_proper són emmascarats per
+    target_mask del dataset i no contribueixen a la pèrdua.
     """
 
     def __init__(
@@ -148,27 +163,38 @@ class StateHead(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_in)
         self.mlp  = nn.Sequential(
-            nn.Linear(d_in + 2 + 1, hidden),
+            nn.Linear(d_in + 2 + 1 + 1, hidden),       # h_cond + pos + dt_k + delta_t
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden // 2),
             nn.GELU(),
             nn.Linear(hidden // 2, 2),
         )
+        # dt_k[k] = (k+1) * PRED_STEP_S, k ∈ {0, ..., T_PRED_MAX-1}
+        dt_k = torch.arange(1, T_PRED_MAX + 1, dtype=torch.float32) * PRED_STEP_S
+        self.register_buffer("dt_k", dt_k)              # [T_PRED_MAX]
 
     def forward(
         self,
-        h_cond: torch.Tensor,         # [B, d_in]
-        current_pos: torch.Tensor,    # [B, N, 2]
-        delta_t: torch.Tensor,        # [B]   (segons)
+        h_cond: torch.Tensor,        # [B, d_in]
+        current_pos: torch.Tensor,   # [B, N, 2]
+        delta_t: torch.Tensor,       # [B]   (segons; predicció del TimeHead)
     ) -> torch.Tensor:
         B, N, _ = current_pos.shape
-        h = self.norm(h_cond)                                      # [B, d_in]
-        h_exp  = h.unsqueeze(1).expand(B, N, h.shape[-1])          # [B, N, d_in]
-        dt_exp = delta_t.view(B, 1, 1).expand(B, N, 1)             # [B, N, 1]
-        feat = torch.cat([h_exp, current_pos, dt_exp], dim=-1)     # [B, N, d_in+3]
-        delta_pos = self.mlp(feat)                                 # [B, N, 2]
-        return current_pos + delta_pos                             # [B, N, 2]
+        K = T_PRED_MAX
+        d_in = h_cond.shape[-1]
+
+        h = self.norm(h_cond)                                                 # [B, d_in]
+
+        # Broadcast a [B, K, N, *]
+        h_exp        = h.view(B, 1, 1, d_in).expand(B, K, N, d_in)
+        pos_exp      = current_pos.view(B, 1, N, 2).expand(B, K, N, 2)
+        dt_k_exp     = self.dt_k.view(1, K, 1, 1).expand(B, K, N, 1)
+        delta_t_exp  = delta_t.view(B, 1, 1, 1).expand(B, K, N, 1)
+
+        feat = torch.cat([h_exp, pos_exp, dt_k_exp, delta_t_exp], dim=-1)    # [B,K,N,d_in+4]
+        delta_pos = self.mlp(feat)                                            # [B, K, N, 2]
+        return pos_exp + delta_pos                                            # [B, K, N, 2]
 
 
 # ── 6. Smoke test ───────────────────────────────────────────────────────────
@@ -186,24 +212,28 @@ if __name__ == "__main__":
 
     time_head  = TimeHead(d_cond)
     pause_head = PauseHead(d_cond)
-    state_head = StateHead(d_cond)
+    traj_head  = TrajectoryHead(d_cond)
 
     mu, log_sigma = time_head(h_cond)
     pause_logit   = pause_head(h_cond)
 
     current_pos = torch.randn(B, N_NODES, 2) * 30.0
     delta_t     = torch.rand(B) * 10.0
-    state_final = state_head(h_cond, current_pos, delta_t)
+    traj_pred   = traj_head(h_cond, current_pos, delta_t)
 
-    print(f"  logits      shape={tuple(logits.shape)}      (esperat ({B}, {N_PHASE_CLASSES}))")
-    print(f"  emb_event   shape={tuple(emb.shape)}      (esperat ({B}, {EVENT_EMB_DIM}))")
-    print(f"  h_cond      shape={tuple(h_cond.shape)}     (esperat ({B}, {d_cond}))")
-    print(f"  μ           shape={tuple(mu.shape)}, range=[{mu.min().item():+.2f}, {mu.max().item():+.2f}]")
-    print(f"  log σ       shape={tuple(log_sigma.shape)}, range=[{log_sigma.min().item():+.2f}, {log_sigma.max().item():+.2f}]")
+    print(f"  logits      shape={tuple(logits.shape)}")
+    print(f"  emb_event   shape={tuple(emb.shape)}")
+    print(f"  h_cond      shape={tuple(h_cond.shape)}")
+    print(f"  μ / log σ   shapes={tuple(mu.shape)}, {tuple(log_sigma.shape)}")
     print(f"  pause_logit shape={tuple(pause_logit.shape)}")
-    print(f"  state_final shape={tuple(state_final.shape)}     (esperat ({B}, {N_NODES}, 2))")
+    print(f"  traj_pred   shape={tuple(traj_pred.shape)}    (esperat ({B}, {T_PRED_MAX}, {N_NODES}, 2))")
 
-    n_params = sum(p.numel() for h in [event_head, event_emb, time_head, pause_head, state_head]
-                              for p in h.parameters() if p.requires_grad)
-    print(f"\n  paràmetres totals de les heads: {n_params:,}")
-    print("[OK] Heads forward pass correcte.")
+    n_params = sum(
+        p.numel() for h in [event_head, event_emb, time_head, pause_head, traj_head]
+                   for p in h.parameters() if p.requires_grad
+    )
+    print(f"\n  paràmetres totals heads: {n_params:,}")
+    print("[OK] Heads smoke test.")
+
+
+

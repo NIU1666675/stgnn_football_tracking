@@ -189,10 +189,12 @@ def main() -> None:
     csv_path = out_dir / "train_log.csv"
     log_keys = [
         "epoch", "lr",
-        "train_total", "train_event", "train_time", "train_pause", "train_state",
-        "train_event_acc", "train_pause_acc", "train_time_mae_s", "train_state_err_m",
-        "val_total",   "val_event",   "val_time",   "val_pause",   "val_state",
-        "val_event_acc",   "val_pause_acc",   "val_time_mae_s",   "val_state_err_m",
+        "train_total", "train_event", "train_time", "train_pause", "train_traj",
+        "train_event_acc", "train_pause_acc", "train_time_mae_s",
+        "train_traj_err_m", "train_final_err_m",
+        "val_total", "val_event", "val_time", "val_pause", "val_traj",
+        "val_event_acc", "val_pause_acc", "val_time_mae_s",
+        "val_traj_err_m", "val_final_err_m",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(log_keys)

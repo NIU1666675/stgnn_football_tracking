@@ -38,6 +38,12 @@ T_MAX           = 200
 # es marquen com a "long pause" i el cap log-normal s'ignora.
 DELTA_PROPER_CAP = 30.0
 
+# Longitud màxima de la trajectòria predita pel TrajectoryHead.
+# Cadència = stride/FPS = 0.3 s. T_PRED_MAX = 100 → fins a 30 s de futur,
+# alineat amb DELTA_PROPER_CAP. Frames més enllà de Δt_proper queden
+# emmascarats per `target_mask` i no contribueixen a la pèrdua.
+T_PRED_MAX = 100
+
 # Partició de partits (per partit, no per seqüència, per evitar fuites).
 N_TRAIN_MATCHES = 8
 N_VAL_MATCHES   = 1
@@ -132,13 +138,16 @@ UNK_POS_IDX     = POSITION_TO_IDX["UNK"]
 
 # Features contextuals per frame (broadcast a tots els nodes):
 #   [match_time_norm, period, score_diff_norm, attacking_LtR,
-#    team_a_in_poss, frames_since_phase_start_norm,
-#    one_hot_phase_actual (9 classes)]
-N_CONTEXT_FEAT = 6 + N_PHASE_CLASSES         # 15
+#    team_a_in_poss, frames_since_phase_start_norm, is_current_phase,
+#    one_hot_phase_type (9 classes)]
+# El camp `is_current_phase` (binari) diu si el frame pertany a curr (1) o no (0).
+# El one-hot `phase_type` indica el tipus de fase a la qual pertany el frame
+# (la prèvia si està a prev; la actual si està a curr; stoppage si està al gap).
+N_CONTEXT_FEAT = 7 + N_PHASE_CLASSES         # 16
 
 # Total de canals d'entrada per node DESPRÉS de l'embedding de posició
 # = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT
-N_FEAT_INPUT_AFTER_EMB = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT  # 31
+N_FEAT_INPUT_AFTER_EMB = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT  # 32
 
 
 # Normalització per match_time. La part més llarga d'un partit és ~5400 s.

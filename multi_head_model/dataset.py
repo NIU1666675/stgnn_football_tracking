@@ -55,6 +55,7 @@ from .constants import (
     STOPPAGE_IDX,
     STRIDE,
     T_MAX,
+    T_PRED_MAX,
     DELTA_PROPER_CAP,
     MATCH_TIME_MAX_S,
 )
@@ -327,8 +328,8 @@ class PhaseDataset(Dataset):
             prev_xy[BALL_SLOT] = (bx, by)
             valid_slots[BALL_SLOT] = True
 
-            # Context
-            context[k] = self._build_context(match, curr, period, f)
+            # Context (coherent amb la fase real del frame: curr/prev/gap)
+            context[k] = self._build_context(match, prev, curr, period, f)
 
             # Graf per relació (events del CSV)
             for ed in match.builder.build_frame_graph(f, period):
@@ -374,7 +375,18 @@ class PhaseDataset(Dataset):
 
         delta_restant = max(0.0, (int(curr["frame_end"]) - t_frame) / FPS)
         delta_proper  = float(min(max(delta_proper_raw_s, 0.0), self.delta_proper_cap_s))
-        state_final   = self._compute_state_final(match, slot_map, int(nxt["frame_start"]))
+
+        # Trajectòria target: per cada step k ∈ {1..T_PRED_MAX} llegim el frame
+        # t + k·stride del tracking. Si k·stride > delta_proper_frames, queda
+        # més enllà de next.frame_start → es marca com a invàlid a target_mask.
+        target_traj = np.zeros((T_PRED_MAX, N_NODES, 2), dtype=np.float32)
+        target_mask = np.zeros((T_PRED_MAX,), dtype=bool)
+        if not is_long_pause:
+            n_pred = min(T_PRED_MAX, max(0, round(delta_proper_frames / self.stride)))
+            for k in range(n_pred):
+                frame_k = t_frame + (k + 1) * self.stride
+                target_traj[k] = self._compute_state_final(match, slot_map, frame_k)
+                target_mask[k] = True
 
         return {
             "node_numeric":     torch.from_numpy(node_numeric),
@@ -385,7 +397,8 @@ class PhaseDataset(Dataset):
             "delta_restant":    torch.tensor(delta_restant, dtype=torch.float32),
             "delta_proper":     torch.tensor(delta_proper,  dtype=torch.float32),
             "is_long_pause":    torch.tensor(is_long_pause, dtype=torch.float32),
-            "state_final":      torch.from_numpy(state_final),
+            "target_traj":      torch.from_numpy(target_traj),
+            "target_mask":      torch.from_numpy(target_mask),
             "frame_mask":       torch.from_numpy(frame_mask),
             "boundary_idx":     torch.tensor(boundary, dtype=torch.long),
         }
@@ -447,41 +460,80 @@ class PhaseDataset(Dataset):
     def _build_context(
         self,
         match: _MatchData,
+        prev: Optional[pd.Series],
         curr: pd.Series,
         period: int,
         frame: int,
     ) -> np.ndarray:
+        """
+        Construeix el vector de context d'un frame, **coherent amb la fase a
+        la qual pertany realment el frame**:
+          - frames dins de `curr` → atributs de curr,   is_current_phase = 1
+          - frames dins de `prev` → atributs de prev,   is_current_phase = 0
+          - frames al gap entre prev i curr (stoppage real) →
+                phase_type = STOPPAGE,                  is_current_phase = 0
+                attacking/possession heretats de prev (per coherència)
+
+        Layout del vector (N_CONTEXT_FEAT = 16):
+          [0]    match_time_norm
+          [1]    period (0 o 1)
+          [2]    score_diff_norm  (0 per ara: no disponible per frame)
+          [3]    attacking_LtR
+          [4]    team_a_in_poss
+          [5]    frames_since_phase_start_norm (relatiu a la fase pròpia)
+          [6]    is_current_phase    ← nou
+          [7:16] one-hot del phase_type (9 classes, incloent stoppage)
+        """
         ctx = np.zeros((N_CONTEXT_FEAT,), dtype=np.float32)
 
+        # ── temps absolut i període (no depenen de la fase) ─────────────────
         ft = match.builder.tracking_frames.get(frame)
         match_time_s = _parse_timestamp(ft.timestamp) if ft is not None else 0.0
         ctx[0] = float(np.clip(match_time_s / MATCH_TIME_MAX_S, 0.0, 1.0))
         ctx[1] = float(period - 1)
+        ctx[2] = 0.0   # score_diff (no disponible per frame)
 
-        # score_diff: el match.json no porta score per frame; ho deixem a 0.
-        ctx[2] = 0.0
+        # ── fase a la qual pertany el frame ────────────────────────────────
+        in_curr = (int(curr["frame_start"]) <= frame <= int(curr["frame_end"]))
+        in_prev = (
+            prev is not None
+            and int(prev["frame_start"]) <= frame <= int(prev["frame_end"])
+        )
 
-        # attacking_LtR (per fila de fase)
-        attacking_side = curr.get("attacking_side", "left_to_right")
+        if in_curr:
+            ref = curr
+            phase_type   = ref.get("team_in_possession_phase_type")
+            phase_start  = int(ref["frame_start"])
+            ctx[6] = 1.0  # is_current_phase
+        elif in_prev:
+            ref = prev
+            phase_type   = ref.get("team_in_possession_phase_type")
+            phase_start  = int(ref["frame_start"])
+            ctx[6] = 0.0
+        else:
+            # Frame al gap entre prev i curr: stoppage real.
+            ref = prev if prev is not None else curr   # per heretar atacant/poss.
+            phase_type   = "stoppage"
+            phase_start  = int(ref["frame_end"])       # rellotge des del final de prev
+            ctx[6] = 0.0
+
+        # ── atributs derivats de la fase de referència ─────────────────────
+        attacking_side = ref.get("attacking_side", "left_to_right")
         ctx[3] = 1.0 if attacking_side == "left_to_right" else 0.0
 
-        # team_a_in_poss (home == team A)
-        team_in_poss_id = curr.get("team_in_possession_id")
+        team_in_poss_id = ref.get("team_in_possession_id")
         if pd.isna(team_in_poss_id):
             ctx[4] = 0.0
         else:
             ctx[4] = 1.0 if int(team_in_poss_id) == match.home_team_id else 0.0
 
-        # frames_since_phase_start, normalitzat per PHASE_TIME_REF segons
-        phase_start = int(curr["frame_start"])
         ctx[5] = float(np.clip((frame - phase_start) / FPS / PHASE_TIME_REF, 0.0, 1.0))
 
-        # one-hot phase_actual (9 dims)
-        ph_type = curr.get("team_in_possession_phase_type")
-        if isinstance(ph_type, str) and ph_type in PHASE_TYPE_TO_IDX:
-            ctx[6 + PHASE_TYPE_TO_IDX[ph_type]] = 1.0
+        # ── one-hot del phase_type (índex 7..15) ───────────────────────────
+        if isinstance(phase_type, str) and phase_type in PHASE_TYPE_TO_IDX:
+            ctx[7 + PHASE_TYPE_TO_IDX[phase_type]] = 1.0
         else:
-            ctx[6 + STOPPAGE_IDX] = 1.0
+            ctx[7 + STOPPAGE_IDX] = 1.0
 
         return ctx
 
