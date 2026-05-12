@@ -1,0 +1,13 @@
+# Dependències mínimes per executar el codi del projecte
+# (multi_head_model/ + stgcn_tracking/).
+#
+# Instal·lació recomanada:
+#   pip install -r requirements.txt
+#
+# Per a entrenament en GPU, instal·la PyTorch amb el wheel adequat per a
+# la teva versió de CUDA des de https://pytorch.org/get-started/locally/
+
+torch>=2.5
+numpy>=2.0
+pandas>=2.0
+matplotlib>=3.7
