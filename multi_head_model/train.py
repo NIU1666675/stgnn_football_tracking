@@ -107,7 +107,7 @@ def run_epoch(
         batch = to_device(batch, device)
 
         with torch.set_grad_enabled(is_train):
-            preds   = model(batch, use_predicted_dt=False)        # teacher forcing
+            preds   = model(batch)
             losses  = criterion(preds, batch)
             metrics = compute_metrics(preds, batch)
 

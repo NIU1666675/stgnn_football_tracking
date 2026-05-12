@@ -47,6 +47,12 @@ class MatchGraphBuilder:
             for line in f:
                 row = json.loads(line)
 
+                # Frames de warm-up del tracking (abans del kickoff o entre
+                # períodes) porten `period: null`. Els saltem silenciosament,
+                # ja que no formen part del joc.
+                if row.get("period") is None:
+                    continue
+
                 try:
                     frame_obj = FrameTracking(
                         frame=int(row["frame"]),
@@ -63,7 +69,7 @@ class MatchGraphBuilder:
         self.tracking_frames = tracking_frames
 
     def _load_dynamic_events(self) -> None:
-        df = pd.read_csv(self.dynamic_events_path)
+        df = pd.read_csv(self.dynamic_events_path, low_memory=False)
 
         required_cols = {"frame_start", "frame_end", "period"}
         missing = required_cols - set(df.columns)
