@@ -236,6 +236,28 @@ class PhaseDataset(Dataset):
                 for p_idx in self._collect_valid_phase_indices(match_dir)
             )
 
+    def warm_cache(self, verbose: bool = True) -> None:
+        """
+        Pre-carrega tots els partits al cache LRU. Útil al començament d'un
+        entrenament per evitar que el primer batch trigui minuts a causa de
+        càrregues sincrones de JSONL gegants.
+
+        Només té sentit cridar-ho si `cache_size >= len(match_dirs)`; en cas
+        contrari, els primers partits carregats seran evictats abans
+        d'arribar a entrenar amb ells.
+        """
+        if self._cache.max_size < len(self.match_dirs) and verbose:
+            print(
+                f"  [warm_cache] AVÍS: cache_size={self._cache.max_size} < "
+                f"#partits={len(self.match_dirs)}; alguns partits es "
+                f"recarregaran durant l'entrenament."
+            )
+        for i, match_dir in enumerate(self.match_dirs, 1):
+            if verbose:
+                print(f"  [warm_cache] partit {i}/{len(self.match_dirs)}: "
+                      f"{match_dir.name}")
+            self._cache.get(match_dir)
+
     # ── helpers d'indexació ─────────────────────────────────────────────────
 
     def _collect_valid_phase_indices(self, match_dir: Path) -> List[int]:

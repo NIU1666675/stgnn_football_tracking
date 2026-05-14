@@ -168,6 +168,15 @@ def main() -> None:
     test_ds  = PhaseDataset(test_dirs,  random_t=False, cache_size=args.cache_size)
     print(f"[i] Mostres: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
 
+    # Pre-carrega tots els partits al cache. Així el primer batch no es queda
+    # bloquejat carregant JSONL durant minuts sense feedback.
+    print(f"[i] Pre-carregant partits a memòria...")
+    t0 = time.time()
+    train_ds.warm_cache()
+    val_ds.warm_cache()
+    test_ds.warm_cache()
+    print(f"[i] Cache preparada en {time.time() - t0:.1f}s")
+
     loader_kw = dict(
         batch_size  = args.batch_size,
         num_workers = args.num_workers,

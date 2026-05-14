@@ -44,6 +44,7 @@ class MatchGraphBuilder:
         self.tracking_frames: Dict[int, FrameTracking] = {}
         self.dynamic_events: pd.DataFrame = pd.DataFrame()
         self.phases: pd.DataFrame = pd.DataFrame()
+        self._player_team_map_cache: Optional[Dict[int, int]] = None
 
     def load_data(self) -> None:
         self._load_tracking()
@@ -190,11 +191,21 @@ class MatchGraphBuilder:
         """
         Construeix un mapping player_id → team_id a partir dels dynamic_events.
         Cada (player_id, team_id) apareix com un parell consistent als esdeveniments.
+
+        El resultat es cacheja al primer ús; les crides següents són O(1).
+        Cal així perquè `get_frame_positions` el demana per cada frame i sense
+        cache cada `_build_sample` repetia el càlcul ~200 vegades.
         """
+        if self._player_team_map_cache is not None:
+            return self._player_team_map_cache
         if self.dynamic_events.empty:
-            return {}
+            self._player_team_map_cache = {}
+            return self._player_team_map_cache
         df = self.dynamic_events[["player_id", "team_id"]].dropna().drop_duplicates()
-        return {int(r.player_id): int(r.team_id) for r in df.itertuples()}
+        self._player_team_map_cache = {
+            int(r.player_id): int(r.team_id) for r in df.itertuples()
+        }
+        return self._player_team_map_cache
 
     def get_frame_positions(self, frame: int) -> Optional[Dict[str, Any]]:
         """
