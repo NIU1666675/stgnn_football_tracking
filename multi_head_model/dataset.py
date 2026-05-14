@@ -160,18 +160,28 @@ class _MatchData:
         )
 
 
-# Cache mínim: només manté l'últim partit accedit.
+# Cache LRU. Per defecte, mida 1 (només l'últim partit accedit). En entrenament
+# amb shuffle=True és essencial pujar la mida a `len(match_dirs)` per evitar
+# recarregar contínuament el tracking JSONL (cada partit ≈ 200 MB de RAM,
+# però només es carrega un cop per època).
+from collections import OrderedDict
+
+
 class _MatchCache:
-    def __init__(self) -> None:
-        self._key:  Optional[str]        = None
-        self._data: Optional[_MatchData] = None
+    def __init__(self, max_size: int = 1) -> None:
+        self.max_size = max(1, int(max_size))
+        self._store: "OrderedDict[str, _MatchData]" = OrderedDict()
 
     def get(self, match_dir: Path) -> _MatchData:
         key = str(match_dir)
-        if key != self._key:
-            self._data = _MatchData(match_dir)
-            self._key  = key
-        return self._data
+        if key in self._store:
+            self._store.move_to_end(key)              # marca com a recent
+            return self._store[key]
+        data = _MatchData(match_dir)
+        self._store[key] = data
+        if len(self._store) > self.max_size:
+            self._store.popitem(last=False)           # evict el més antic
+        return data
 
 
 # ── Dataset ─────────────────────────────────────────────────────────────────
@@ -191,6 +201,7 @@ class PhaseDataset(Dataset):
         random_t: bool = True,
         val_t_fraction: float = 0.75,
         min_input_frames: int = 2,
+        cache_size: Optional[int] = None,
     ) -> None:
         self.match_dirs         = [Path(d) for d in match_dirs]
         self.t_max              = int(t_max)
@@ -202,7 +213,10 @@ class PhaseDataset(Dataset):
         self.val_t_fraction     = float(np.clip(val_t_fraction, 0.0, 1.0))
         self.min_input_frames   = max(1, int(min_input_frames))
 
-        self._cache = _MatchCache()
+        # Mida del cache LRU. Per defecte = len(match_dirs) → tots els partits
+        # en memòria després del primer accés. Per cada partit ≈ 200 MB de RAM.
+        eff_cache = cache_size if cache_size is not None else len(self.match_dirs)
+        self._cache = _MatchCache(max_size=eff_cache)
 
         # Index de mostres: (match_idx, phase_idx). Llegim només els CSV de phases
         # per construir-lo (els JSONL grans no s'obren al __init__).

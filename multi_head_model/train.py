@@ -135,6 +135,10 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--grad-clip",    type=float, default=GRAD_CLIP)
     parser.add_argument("--num-workers",  type=int,   default=0)
+    parser.add_argument("--cache-size",   type=int,   default=None,
+                        help="Mida del cache LRU de partits per dataset. "
+                             "Per defecte = nombre de partits del split (tots "
+                             "a RAM, ~200 MB cadascun).")
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--device",       type=str,   default="auto",
                         choices=["auto", "cpu", "cuda"])
@@ -159,9 +163,9 @@ def main() -> None:
     print(f"[i] Test  ({len(test_dirs)}): {[d.name for d in test_dirs]}")
 
     # ── Datasets / Loaders ────────────────────────────────────────────────
-    train_ds = PhaseDataset(train_dirs, random_t=True)
-    val_ds   = PhaseDataset(val_dirs,   random_t=False)
-    test_ds  = PhaseDataset(test_dirs,  random_t=False)
+    train_ds = PhaseDataset(train_dirs, random_t=True,  cache_size=args.cache_size)
+    val_ds   = PhaseDataset(val_dirs,   random_t=False, cache_size=args.cache_size)
+    test_ds  = PhaseDataset(test_dirs,  random_t=False, cache_size=args.cache_size)
     print(f"[i] Mostres: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
 
     loader_kw = dict(
