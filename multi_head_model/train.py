@@ -233,7 +233,8 @@ def main() -> None:
             f"train={train_stats['total']:.3f}  val={val_stats['total']:.3f}  "
             f"event_acc={val_stats['event_acc']:.3f}  "
             f"time_mae={val_stats['time_mae_s']:.2f}s  "
-            f"state_err={val_stats['state_err_m']:.2f}m"
+            f"traj_err={val_stats['traj_err_m']:.2f}m  "
+            f"final_err={val_stats['final_err_m']:.2f}m"
         )
 
         # CSV
