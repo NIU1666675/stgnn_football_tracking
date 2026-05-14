@@ -9,6 +9,16 @@ import numpy as np
 import pandas as pd
 import argparse
 
+# orjson és ~3-5× més ràpid que json estàndard. Si no està instal·lat,
+# caiem a json (drop-in compatible per a .loads).
+try:
+    import orjson as _fastjson  # type: ignore
+    def _json_loads(line: str | bytes):
+        return _fastjson.loads(line)
+except ImportError:
+    def _json_loads(line: str | bytes):
+        return json.loads(line)
+
 
 @dataclass
 class FrameTracking:
@@ -43,9 +53,9 @@ class MatchGraphBuilder:
     def _load_tracking(self) -> None:
         tracking_frames: Dict[int, FrameTracking] = {}
 
-        with self.tracking_path.open("r", encoding="utf-8") as f:
+        with self.tracking_path.open("rb") as f:        # rb per a orjson (3–5× més ràpid)
             for line in f:
-                row = json.loads(line)
+                row = _json_loads(line)
 
                 # Frames de warm-up del tracking (abans del kickoff o entre
                 # períodes) porten `period: null`. Els saltem silenciosament,

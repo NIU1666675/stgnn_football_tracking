@@ -177,10 +177,19 @@ class _MatchCache:
         if key in self._store:
             self._store.move_to_end(key)              # marca com a recent
             return self._store[key]
+        import time, sys
+        t0 = time.time()
+        print(f"  [cache] carregant partit {match_dir.name}...",
+              end="", flush=True, file=sys.stderr)
         data = _MatchData(match_dir)
+        print(f" {time.time() - t0:.1f}s "
+              f"(cache: {len(self._store) + 1}/{self.max_size})",
+              file=sys.stderr, flush=True)
         self._store[key] = data
         if len(self._store) > self.max_size:
-            self._store.popitem(last=False)           # evict el més antic
+            evicted = self._store.popitem(last=False)
+            print(f"  [cache] evict {Path(evicted[0]).name}",
+                  file=sys.stderr, flush=True)
         return data
 
 

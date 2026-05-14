@@ -11,3 +11,7 @@ torch>=2.5
 numpy>=2.0
 pandas>=2.0
 matplotlib>=3.7
+
+# Accelera 3-5× el parseig dels tracking_extrapolated.jsonl (cada partit té
+# ~60-90k línies JSON). Si no està instal·lat, es cau al `json` estàndard.
+orjson>=3.9
