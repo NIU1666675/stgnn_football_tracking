@@ -7,3 +7,6 @@
 *.ipynb
 /multi_head_output
 *.csv
+*/__pycache__
+*.pyc
+*.pt
