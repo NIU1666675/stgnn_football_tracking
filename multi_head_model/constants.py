@@ -147,17 +147,21 @@ BALL_POS_IDX    = POSITION_TO_IDX["BALL"]
 UNK_POS_IDX     = POSITION_TO_IDX["UNK"]
 
 # Features contextuals per frame (broadcast a tots els nodes):
-#   [match_time_norm, period, score_diff_norm, attacking_LtR,
-#    team_a_in_poss, frames_since_phase_start_norm, is_current_phase,
+#   [match_time_norm, period, attacking_LtR, team_a_in_poss,
+#    frames_since_phase_start_norm, is_current_phase,
 #    one_hot_phase_type (9 classes)]
 # El camp `is_current_phase` (binari) diu si el frame pertany a curr (1) o no (0).
 # El one-hot `phase_type` indica el tipus de fase a la qual pertany el frame
 # (la prèvia si està a prev; la actual si està a curr; stoppage si està al gap).
-N_CONTEXT_FEAT = 7 + N_PHASE_CLASSES         # 16
+#
+# NOTA: score_diff_norm es va eliminar perquè el match.json no porta la
+# cronologia dels gols, així que sempre era 0 (canal mort). Si en algun
+# moment es parsegen els gols de dynamic_events, es pot tornar a afegir.
+N_CONTEXT_FEAT = 6 + N_PHASE_CLASSES         # 15
 
 # Total de canals d'entrada per node DESPRÉS de l'embedding de posició
 # = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT
-N_FEAT_INPUT_AFTER_EMB = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT  # 32
+N_FEAT_INPUT_AFTER_EMB = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT  # 31
 
 
 # Normalització per match_time. La part més llarga d'un partit és ~5400 s.

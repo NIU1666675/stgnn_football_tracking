@@ -661,15 +661,14 @@ class PhaseDataset(Dataset):
                 phase_type = STOPPAGE,                  is_current_phase = 0
                 attacking/possession heretats de prev (per coherència)
 
-        Layout del vector (N_CONTEXT_FEAT = 16):
+        Layout del vector (N_CONTEXT_FEAT = 15):
           [0]    match_time_norm
           [1]    period (0 o 1)
-          [2]    score_diff_norm  (0 per ara: no disponible per frame)
-          [3]    attacking_LtR
-          [4]    team_a_in_poss
-          [5]    frames_since_phase_start_norm (relatiu a la fase pròpia)
-          [6]    is_current_phase    ← nou
-          [7:16] one-hot del phase_type (9 classes, incloent stoppage)
+          [2]    attacking_LtR
+          [3]    team_a_in_poss
+          [4]    frames_since_phase_start_norm (relatiu a la fase pròpia)
+          [5]    is_current_phase
+          [6:15] one-hot del phase_type (9 classes, incloent stoppage)
         """
         ctx = np.zeros((N_CONTEXT_FEAT,), dtype=np.float32)
 
@@ -678,7 +677,6 @@ class PhaseDataset(Dataset):
         match_time_s = _parse_timestamp(ft.timestamp) if ft is not None else 0.0
         ctx[0] = float(np.clip(match_time_s / MATCH_TIME_MAX_S, 0.0, 1.0))
         ctx[1] = float(period - 1)
-        ctx[2] = 0.0   # score_diff (no disponible per frame)
 
         # ── fase a la qual pertany el frame ────────────────────────────────
         in_curr = (int(curr["frame_start"]) <= frame <= int(curr["frame_end"]))
@@ -691,36 +689,36 @@ class PhaseDataset(Dataset):
             ref = curr
             phase_type   = ref.get("team_in_possession_phase_type")
             phase_start  = int(ref["frame_start"])
-            ctx[6] = 1.0  # is_current_phase
+            ctx[5] = 1.0  # is_current_phase
         elif in_prev:
             ref = prev
             phase_type   = ref.get("team_in_possession_phase_type")
             phase_start  = int(ref["frame_start"])
-            ctx[6] = 0.0
+            ctx[5] = 0.0
         else:
             # Frame al gap entre prev i curr: stoppage real.
             ref = prev if prev is not None else curr   # per heretar atacant/poss.
             phase_type   = "stoppage"
             phase_start  = int(ref["frame_end"])       # rellotge des del final de prev
-            ctx[6] = 0.0
+            ctx[5] = 0.0
 
         # ── atributs derivats de la fase de referència ─────────────────────
         attacking_side = ref.get("attacking_side", "left_to_right")
-        ctx[3] = 1.0 if attacking_side == "left_to_right" else 0.0
+        ctx[2] = 1.0 if attacking_side == "left_to_right" else 0.0
 
         team_in_poss_id = ref.get("team_in_possession_id")
         if pd.isna(team_in_poss_id):
-            ctx[4] = 0.0
+            ctx[3] = 0.0
         else:
-            ctx[4] = 1.0 if int(team_in_poss_id) == match.home_team_id else 0.0
+            ctx[3] = 1.0 if int(team_in_poss_id) == match.home_team_id else 0.0
 
-        ctx[5] = float(np.clip((frame - phase_start) / FPS / PHASE_TIME_REF, 0.0, 1.0))
+        ctx[4] = float(np.clip((frame - phase_start) / FPS / PHASE_TIME_REF, 0.0, 1.0))
 
-        # ── one-hot del phase_type (índex 7..15) ───────────────────────────
+        # ── one-hot del phase_type (índex 6..14) ───────────────────────────
         if isinstance(phase_type, str) and phase_type in PHASE_TYPE_TO_IDX:
-            ctx[7 + PHASE_TYPE_TO_IDX[phase_type]] = 1.0
+            ctx[6 + PHASE_TYPE_TO_IDX[phase_type]] = 1.0
         else:
-            ctx[7 + STOPPAGE_IDX] = 1.0
+            ctx[6 + STOPPAGE_IDX] = 1.0
 
         return ctx
 
