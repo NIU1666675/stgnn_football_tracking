@@ -10,3 +10,4 @@
 */__pycache__
 *.pyc
 *.pt
+multi_head_model/.ipynb_checkpoints/
