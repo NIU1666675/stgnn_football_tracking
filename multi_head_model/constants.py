@@ -32,7 +32,12 @@ STRIDE          = 3
 # Sostre de longitud temporal d'entrada (en frames mostrejats després de stride).
 # Si la combinació prèvia + actual el supera, es trunca des del començament
 # de la fase prèvia. La fase actual mai es trunca.
-T_MAX           = 200
+#
+# T_MAX=100 (= 30 s d'input màxim amb stride 0.3 s) cobreix el >99% de mostres
+# segons l'anàlisi de la distribució real de T_real (mediana=35, p90=87).
+# Redueix la memòria de `adj_per_relation` i les activacions del Transformer
+# a la meitat sense afectar el nombre de paràmetres del model.
+T_MAX           = 100
 
 # Capping per a Δt_proper (segons). Mostres amb Δt_proper > 30s
 # es marquen com a "long pause" i el cap log-normal s'ignora.
@@ -43,6 +48,11 @@ DELTA_PROPER_CAP = 30.0
 # alineat amb DELTA_PROPER_CAP. Frames més enllà de Δt_proper queden
 # emmascarats per `target_mask` i no contribueixen a la pèrdua.
 T_PRED_MAX = 100
+
+# Nombre de components de la mixture-of-log-normals al TimeHead.
+# K=2 captura la bimodalitat curt/llarg de Δt_proper sense afegir massa
+# paràmetres. La inferència fa servir la mitjana ponderada Σπ_k·E[y_k].
+N_TIME_MIXTURE = 2
 
 # Partició de partits (per partit, no per seqüència, per evitar fuites).
 N_TRAIN_MATCHES = 8
@@ -170,4 +180,14 @@ LR_FACTOR      = 0.5
 LAMBDA_EVENT   = 1.0
 LAMBDA_TIME    = 1.0
 LAMBDA_PAUSE   = 0.5
+LAMBDA_POSS    = 0.5    # canvi de possessió a la propera fase
 LAMBDA_STATE   = 1.0
+
+
+# ── 7. VALIDACIÓ MULTIPOINT ─────────────────────────────────────────────────
+
+# Per evitar avaluar només a un instant fix (que esbiaixa el monitoring cap a
+# transicions imminents), el conjunt de validació/test pot multiplicar cada
+# fase amb diversos instants t determinístics dins de la fase. Cada element
+# de la llista és la fracció de la durada de la fase (0=start, 1=end).
+VAL_T_FRACTIONS = [0.25, 0.50, 0.75]

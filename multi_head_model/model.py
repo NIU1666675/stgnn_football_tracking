@@ -41,9 +41,11 @@ from .heads   import (
     EventEmbedding,
     TimeHead,
     PauseHead,
+    PossessionChangeHead,
     TrajectoryHead,
     EVENT_EMB_DIM,
 )
+from .losses  import mixture_lognormal_mean
 
 
 # ── Helper: extreure features del frame de predicció ───────────────────────
@@ -81,6 +83,7 @@ class MultiHeadModel(nn.Module):
         self.event_emb  = EventEmbedding(EVENT_EMB_DIM)
         self.time_head  = TimeHead(d_cond)
         self.pause_head = PauseHead(d_cond)
+        self.poss_head  = PossessionChangeHead(d_cond)
         self.traj_head  = TrajectoryHead(d_cond)
 
     def forward(
@@ -103,9 +106,11 @@ class MultiHeadModel(nn.Module):
         emb_event = self.event_emb(event_logits)                   # [B, E]
         h_cond    = torch.cat([h, emb_event], dim=-1)              # [B, D+E]
 
-        # 4. Time / Pause heads
-        time_mu, time_log_sigma = self.time_head(h_cond)           # [B], [B]
-        pause_logit             = self.pause_head(h_cond)          # [B]
+        # 4. Time / Pause / PossessionChange heads
+        time_mix_logits, time_mu, time_log_sigma = self.time_head(h_cond)
+        # → tots tres tenen forma [B, K], on K = N_TIME_MIXTURE
+        pause_logit = self.pause_head(h_cond)                      # [B]
+        poss_logit  = self.poss_head(h_cond)                       # [B]
 
         # 5. TrajectoryHead: current_pos al frame t + Δt predit (sense leakage)
         node_numeric = batch["node_numeric"]                       # [B, T, N, 8]
@@ -114,17 +119,22 @@ class MultiHeadModel(nn.Module):
             node_numeric[..., :2], frame_mask,                     # canals 0,1 = x, y
         )                                                          # [B, N, 2]
 
-        # .detach() impedeix que la trajectory_loss propagi gradient al TimeHead
-        delta_t = time_mu.exp().detach()                           # [B]
+        # Predicció puntual del Δt = E[y] de la mixture log-normal.
+        # .detach() impedeix que la trajectory_loss propagi gradient al TimeHead.
+        delta_t = mixture_lognormal_mean(
+            time_mix_logits, time_mu, time_log_sigma,
+        ).detach()                                                 # [B]
 
         traj_pred = self.traj_head(h_cond, current_pos, delta_t)   # [B, T_PRED_MAX, N, 2]
 
         return {
-            "event_logits":   event_logits,
-            "time_mu":        time_mu,
-            "time_log_sigma": time_log_sigma,
-            "pause_logit":    pause_logit,
-            "traj_pred":      traj_pred,
+            "event_logits":    event_logits,
+            "time_mix_logits": time_mix_logits,
+            "time_mu":         time_mu,
+            "time_log_sigma":  time_log_sigma,
+            "pause_logit":     pause_logit,
+            "poss_logit":      poss_logit,
+            "traj_pred":       traj_pred,
         }
 
     def count_parameters(self) -> int:

@@ -45,6 +45,7 @@ from .constants import (
     N_NODE_NUMERIC_FEAT,
     N_CONTEXT_FEAT,
     N_EVENT_TYPES,
+    N_PHASE_CLASSES,
     SPATIAL_PROXIMITY_IDX,
     SPATIAL_SIGMA,
     PHASE_TYPE_TO_IDX,
@@ -209,9 +210,26 @@ class PhaseDataset(Dataset):
         delta_proper_cap_s: float = DELTA_PROPER_CAP,
         random_t: bool = True,
         val_t_fraction: float = 0.75,
+        val_t_fractions: Optional[List[float]] = None,
         min_input_frames: int = 2,
         cache_size: Optional[int] = None,
+        samples_per_phase: int = 1,
     ) -> None:
+        """
+        random_t / val_t_fraction / val_t_fractions controlen com es tria
+        l'instant de predicció `t` dins de la fase actual:
+
+          - random_t=True  → uniforme aleatori a cada __getitem__
+                             (val_t_fraction(s) s'ignoren). Per entrenament.
+
+          - random_t=False
+              · si val_t_fractions és None: `t = val_t_fraction · durada`
+                (1 mostra per fase, comportament original).
+              · si val_t_fractions és una llista: el dataset multiplica cada
+                fase per len(val_t_fractions), una mostra per cada fracció.
+                Aquesta és la configuració "multipoint" recomanada per a val
+                i test, per cobrir uniformement diversos horitzons.
+        """
         self.match_dirs         = [Path(d) for d in match_dirs]
         self.t_max              = int(t_max)
         self.stride             = int(stride)
@@ -220,21 +238,102 @@ class PhaseDataset(Dataset):
         self.dt_step_s          = self.stride / FPS
         self.random_t           = bool(random_t)
         self.val_t_fraction     = float(np.clip(val_t_fraction, 0.0, 1.0))
+        self.val_t_fractions    = (
+            [float(np.clip(f, 0.0, 1.0)) for f in val_t_fractions]
+            if val_t_fractions is not None else None
+        )
         self.min_input_frames   = max(1, int(min_input_frames))
+        self.samples_per_phase  = max(1, int(samples_per_phase))
 
         # Mida del cache LRU. Per defecte = len(match_dirs) → tots els partits
         # en memòria després del primer accés. Per cada partit ≈ 200 MB de RAM.
         eff_cache = cache_size if cache_size is not None else len(self.match_dirs)
         self._cache = _MatchCache(max_size=eff_cache)
 
-        # Index de mostres: (match_idx, phase_idx). Llegim només els CSV de phases
-        # per construir-lo (els JSONL grans no s'obren al __init__).
-        self.samples: List[Tuple[int, int]] = []
-        for m_idx, match_dir in enumerate(self.match_dirs):
-            self.samples.extend(
-                (m_idx, p_idx)
-                for p_idx in self._collect_valid_phase_indices(match_dir)
+        # Index de mostres: (match_idx, phase_idx, frac_idx). El `frac_idx`
+        # només és rellevant quan random_t=False i val_t_fractions està
+        # definit; en els altres casos val sempre 0.
+        #
+        # Quan random_t=True (train), cada fase es replica `samples_per_phase`
+        # vegades. Cada còpia rebrà un `t` aleatori independent al
+        # __getitem__, fet que multiplica el nombre de mostres efectives per
+        # època sense duplicar informació (és augmentació estocàstica
+        # explícita). Amb shuffle=True, les còpies queden distribuïdes
+        # uniformement al llarg de l'època.
+        if self.random_t:
+            n_replicas = self.samples_per_phase
+        else:
+            n_replicas = (
+                len(self.val_t_fractions)
+                if self.val_t_fractions is not None else 1
             )
+        self.samples: List[Tuple[int, int, int]] = []
+        for m_idx, match_dir in enumerate(self.match_dirs):
+            for p_idx in self._collect_valid_phase_indices(match_dir):
+                for frac_idx in range(n_replicas):
+                    self.samples.append((m_idx, p_idx, frac_idx))
+
+    def compute_class_stats(self, verbose: bool = True) -> Dict[str, np.ndarray]:
+        """
+        Itera totes les mostres del dataset i agrega comptatges per a:
+          - event_counts  [N_PHASE_CLASSES]  → recompte de cada phase_target
+          - pause_counts  [2]                → 0=no_pause, 1=long_pause
+          - poss_counts   [2]                → 0=manteniment, 1=canvi
+                                              (ignora els sentinels -1)
+
+        Implementació *lleugera*: replica només la lògica del càlcul de
+        targets de `_build_sample` (sense generar el graf, tracking ni
+        context) per ser ràpida. Útil per a pesos de classes a la loss.
+        """
+        event_counts = np.zeros(N_PHASE_CLASSES, dtype=np.int64)
+        pause_counts = np.zeros(2, dtype=np.int64)
+        poss_counts  = np.zeros(2, dtype=np.int64)
+
+        if verbose:
+            print(f"  [class_stats] iterant {len(self.samples)} mostres...")
+
+        for m_idx, p_idx, frac_idx in self.samples:
+            match = self._cache.get(self.match_dirs[m_idx])
+            phases = match.phases
+            curr   = phases.iloc[p_idx]
+            nxt    = phases.iloc[p_idx + 1]
+
+            t_frame = self._sample_t(curr, frac_idx)
+            delta_proper_frames = int(nxt["frame_start"]) - t_frame
+            delta_proper_raw_s  = delta_proper_frames / FPS
+            is_long_pause       = delta_proper_raw_s > self.delta_proper_cap_s
+
+            # phase_target
+            if is_long_pause:
+                pt = STOPPAGE_IDX
+            else:
+                nxt_type = nxt.get("team_in_possession_phase_type")
+                pt = (
+                    PHASE_TYPE_TO_IDX[nxt_type]
+                    if isinstance(nxt_type, str) and nxt_type in PHASE_TYPE_TO_IDX
+                    else STOPPAGE_IDX
+                )
+            event_counts[pt] += 1
+            pause_counts[int(is_long_pause)] += 1
+
+            # possession_change (ignorem -1 sentinels)
+            curr_team = curr.get("team_in_possession_id")
+            nxt_team  = nxt.get("team_in_possession_id")
+            if not (pd.isna(curr_team) or pd.isna(nxt_team) or is_long_pause):
+                poss_counts[int(int(curr_team) != int(nxt_team))] += 1
+
+        if verbose:
+            print(f"  [class_stats] event = {event_counts.tolist()}")
+            print(f"  [class_stats] pause = {pause_counts.tolist()}  "
+                  f"(pos_weight ≈ {pause_counts[0] / max(pause_counts[1], 1):.2f})")
+            print(f"  [class_stats] poss  = {poss_counts.tolist()}  "
+                  f"(pos_weight ≈ {poss_counts[0] / max(poss_counts[1], 1):.2f})")
+
+        return {
+            "event": event_counts,
+            "pause": pause_counts,
+            "poss":  poss_counts,
+        }
 
     def warm_cache(self, verbose: bool = True) -> None:
         """
@@ -281,20 +380,25 @@ class PhaseDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        m_idx, p_idx = self.samples[idx]
+        m_idx, p_idx, frac_idx = self.samples[idx]
         match = self._cache.get(self.match_dirs[m_idx])
-        return self._build_sample(match, p_idx)
+        return self._build_sample(match, p_idx, frac_idx)
 
     # ── construcció d'una mostra ────────────────────────────────────────────
 
-    def _build_sample(self, match: _MatchData, p_idx: int) -> Dict[str, torch.Tensor]:
+    def _build_sample(
+        self,
+        match: _MatchData,
+        p_idx: int,
+        frac_idx: int = 0,
+    ) -> Dict[str, torch.Tensor]:
         phases = match.phases
         curr   = phases.iloc[p_idx]
         nxt    = phases.iloc[p_idx + 1]
         period = int(curr["period"])
 
         # Instant de predicció: aleatori dins la fase (train) o deterministe (val).
-        t_frame = self._sample_t(curr)
+        t_frame = self._sample_t(curr, frac_idx)
 
         # Fase prèvia (mateix període)
         prev = None
@@ -418,6 +522,16 @@ class PhaseDataset(Dataset):
                 else STOPPAGE_IDX
             )
 
+        # Canvi de possessió entre la fase actual i la propera.
+        # 1 = canvi de possessió, 0 = manteniment.
+        # En long_pause el target es marca com -1 (mask) per indicar irrelevant.
+        curr_team = curr.get("team_in_possession_id")
+        nxt_team  = nxt.get("team_in_possession_id")
+        if (pd.isna(curr_team) or pd.isna(nxt_team)) or is_long_pause:
+            possession_change = -1.0      # sentinel d'ignore
+        else:
+            possession_change = float(int(curr_team) != int(nxt_team))
+
         delta_restant = max(0.0, (int(curr["frame_end"]) - t_frame) / FPS)
         delta_proper  = float(min(max(delta_proper_raw_s, 0.0), self.delta_proper_cap_s))
 
@@ -434,30 +548,42 @@ class PhaseDataset(Dataset):
                 target_mask[k] = True
 
         return {
-            "node_numeric":     torch.from_numpy(node_numeric),
-            "position_idx":     torch.from_numpy(position_idx),
-            "context":          torch.from_numpy(context),
-            "adj_per_relation": torch.from_numpy(adj),
-            "phase_target":     torch.tensor(phase_target,  dtype=torch.long),
-            "delta_restant":    torch.tensor(delta_restant, dtype=torch.float32),
-            "delta_proper":     torch.tensor(delta_proper,  dtype=torch.float32),
-            "is_long_pause":    torch.tensor(is_long_pause, dtype=torch.float32),
-            "target_traj":      torch.from_numpy(target_traj),
-            "target_mask":      torch.from_numpy(target_mask),
-            "frame_mask":       torch.from_numpy(frame_mask),
-            "boundary_idx":     torch.tensor(boundary, dtype=torch.long),
+            "node_numeric":      torch.from_numpy(node_numeric),
+            "position_idx":      torch.from_numpy(position_idx),
+            "context":           torch.from_numpy(context),
+            "adj_per_relation":  torch.from_numpy(adj),
+            "phase_target":      torch.tensor(phase_target,      dtype=torch.long),
+            "delta_restant":     torch.tensor(delta_restant,     dtype=torch.float32),
+            "delta_proper":      torch.tensor(delta_proper,      dtype=torch.float32),
+            "is_long_pause":     torch.tensor(is_long_pause,     dtype=torch.float32),
+            "possession_change": torch.tensor(possession_change, dtype=torch.float32),
+            "target_traj":       torch.from_numpy(target_traj),
+            "target_mask":       torch.from_numpy(target_mask),
+            "frame_mask":        torch.from_numpy(frame_mask),
+            "boundary_idx":      torch.tensor(boundary, dtype=torch.long),
         }
 
     # ── helpers de construcció ──────────────────────────────────────────────
 
-    def _sample_t(self, curr: pd.Series) -> int:
+    def _sample_t(self, curr: pd.Series, frac_idx: int = 0) -> int:
         """
         Mostreja l'instant de predicció `t` (en frames originals) dins la fase
         actual. Garanteix com a mínim `min_input_frames` mostrejats de la fase
         actual: t ≥ frame_start + (min_input_frames - 1) * stride.
 
-        En mode `random_t`, uniforme a [t_min, t_max].
-        Altrament, deterministe a `val_t_fraction` del rang.
+        Modes:
+          - random_t=True:
+              · samples_per_phase==1 → uniforme a [t_min, t_max].
+              · samples_per_phase>1  → **mostreig estratificat**:
+                el rang es divideix en N=samples_per_phase segments iguals i
+                la còpia `frac_idx` mostreja dins del seu segment. Així:
+                  · cap còpia pot caure al mateix `t` (sense col·lisions)
+                  · les còpies cobreixen uniformement el rang
+                  · cada còpia manté aleatorietat *dins* del seu segment
+          - random_t=False:
+              · si val_t_fractions està definit → fa servir
+                `val_t_fractions[frac_idx]` (mode multipoint).
+              · si no, fa servir `val_t_fraction` (un sol punt deterministe).
 
         Si la fase és massa curta per arribar al mínim, retorna el màxim possible.
         """
@@ -471,9 +597,25 @@ class PhaseDataset(Dataset):
             return max(fs, t_max)
         if t_max == t_min:
             return t_min
+
         if self.random_t:
-            return int(np.random.default_rng().integers(t_min, t_max + 1))
-        return t_min + int(self.val_t_fraction * (t_max - t_min))
+            N = self.samples_per_phase
+            if N <= 1:
+                return int(np.random.default_rng().integers(t_min, t_max + 1))
+            # Mostreig estratificat: segment frac_idx-èsim dels N
+            seg_size = (t_max - t_min + 1) / N
+            seg_lo = int(round(t_min + frac_idx * seg_size))
+            seg_hi = int(round(t_min + (frac_idx + 1) * seg_size))
+            seg_hi = max(seg_lo + 1, seg_hi)         # garanteix rang no buit
+            seg_hi = min(seg_hi, t_max + 1)          # no sortim del rang
+            return int(np.random.default_rng().integers(seg_lo, seg_hi))
+
+        frac = (
+            self.val_t_fractions[frac_idx]
+            if self.val_t_fractions is not None
+            else self.val_t_fraction
+        )
+        return t_min + int(frac * (t_max - t_min))
 
     def _build_slot_map(self, match: _MatchData, frames: List[int]) -> Dict[int, int]:
         """11 slots home (0–10) + 11 away (11–21), assignats al primer frame amb dades."""

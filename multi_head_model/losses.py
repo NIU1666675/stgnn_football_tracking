@@ -17,7 +17,7 @@ Mètriques (per monitoring, no entren al gradient):
 from __future__ import annotations
 
 import math
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -27,18 +27,83 @@ from .constants import (
     LAMBDA_EVENT,
     LAMBDA_TIME,
     LAMBDA_PAUSE,
+    LAMBDA_POSS,
     LAMBDA_STATE,
 )
 
 
 # ── 1. Pèrdues individuals ──────────────────────────────────────────────────
 
-def event_ce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """logits [B, K], target [B] long → escalar."""
-    return F.cross_entropy(logits, target)
+def event_ce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    class_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """logits [B, K], target [B] long → escalar.
+    class_weights [K], opcional, per a equilibrar classes desbalancejades.
+    """
+    return F.cross_entropy(logits, target, weight=class_weights)
 
 
 _LOG_2PI_HALF = 0.5 * math.log(2.0 * math.pi)
+
+
+def time_mixture_lognormal_nll(
+    mix_logits: torch.Tensor,
+    mu: torch.Tensor,
+    log_sigma: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """
+    NLL d'una *mixture* de log-normals:
+
+        p(y) = Σ_k π_k · LogN(y; μ_k, σ_k)
+        NLL  = -log p(y) = -logsumexp_k [log π_k + log p_k(y)]
+
+    on log p_k(y) = -log y - log σ_k - ½ log(2π) - (log y - μ_k)² / (2 σ_k²)
+
+    Forma dels tensors:
+      mix_logits : [B, K]
+      mu, log σ  : [B, K]
+      y          : [B]
+      mask       : [B]  (1 si mostra vàlida, 0 si long_pause)
+    """
+    log_y = torch.log(y.clamp(min=eps))                     # [B]
+    sigma = log_sigma.exp()                                  # [B, K]
+
+    # log p_k(y) per cada component
+    log_pk = (
+        -log_y.unsqueeze(-1)                                 # [B, 1]
+        - log_sigma                                          # [B, K]
+        - _LOG_2PI_HALF
+        - (log_y.unsqueeze(-1) - mu) ** 2 / (2.0 * sigma ** 2)
+    )                                                        # [B, K]
+
+    log_pi = F.log_softmax(mix_logits, dim=-1)               # [B, K]
+    log_px = torch.logsumexp(log_pi + log_pk, dim=-1)        # [B]
+
+    nll = -log_px                                            # [B]
+    denom = mask.sum().clamp(min=1.0)
+    return (nll * mask).sum() / denom
+
+
+@torch.no_grad()
+def mixture_lognormal_mean(
+    mix_logits: torch.Tensor,
+    mu: torch.Tensor,
+    log_sigma: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Mitjana esperada E[y] = Σ_k π_k · exp(μ_k + σ_k²/2).
+    Útil com a predicció puntual per a la TrajectoryHead i mètriques.
+    Retorna [B].
+    """
+    pi = F.softmax(mix_logits, dim=-1)                       # [B, K]
+    sigma2 = (2.0 * log_sigma).exp()                         # [B, K]
+    mean_per_k = torch.exp(mu + 0.5 * sigma2)                # [B, K]
+    return (pi * mean_per_k).sum(dim=-1)                     # [B]
 
 
 def time_lognormal_nll(
@@ -64,9 +129,37 @@ def time_lognormal_nll(
     return (nll * mask).sum() / denom
 
 
-def pause_bce_loss(logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """logit [B], target [B] float {0,1} → escalar."""
-    return F.binary_cross_entropy_with_logits(logit, target)
+def pause_bce_loss(
+    logit: torch.Tensor,
+    target: torch.Tensor,
+    pos_weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """logit [B], target [B] float {0,1} → escalar.
+    pos_weight escalar tensor (scalar 1-d) per equilibrar la classe positiva.
+    """
+    return F.binary_cross_entropy_with_logits(
+        logit, target, pos_weight=pos_weight,
+    )
+
+
+def possession_change_bce_loss(
+    logit: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    pos_weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    BCE per al canvi de possessió, emmascarada per long_pause:
+        logit:      [B]
+        target:     [B] float {0,1}
+        mask:       [B] {0,1}   (1 = mostra vàlida, no long_pause)
+        pos_weight: tensor escalar opcional per a la classe positiva
+    """
+    per_sample = F.binary_cross_entropy_with_logits(
+        logit, target, pos_weight=pos_weight, reduction="none",
+    )
+    denom = mask.sum().clamp(min=1.0)
+    return (per_sample * mask).sum() / denom
 
 
 # Factor d'escala per normalitzar coordenades a un rang aproximat [-1, 1].
@@ -123,13 +216,44 @@ class MultiHeadLoss(nn.Module):
         lambda_event: float = LAMBDA_EVENT,
         lambda_time:  float = LAMBDA_TIME,
         lambda_pause: float = LAMBDA_PAUSE,
+        lambda_poss:  float = LAMBDA_POSS,
         lambda_state: float = LAMBDA_STATE,
+        event_class_weights: Optional[torch.Tensor] = None,
+        pause_pos_weight: Optional[float] = None,
+        poss_pos_weight:  Optional[float] = None,
     ) -> None:
         super().__init__()
-        self.le = lambda_event
-        self.lt = lambda_time
-        self.lp = lambda_pause
-        self.ls = lambda_state
+        self.le  = lambda_event
+        self.lt  = lambda_time
+        self.lp  = lambda_pause
+        self.lpo = lambda_poss
+        self.ls  = lambda_state
+
+        # Pesos de classe (registrats com a buffers perquè es moguin amb el
+        # model en .to(device) i es guardin amb el state_dict).
+        if event_class_weights is not None:
+            self.register_buffer(
+                "event_class_weights",
+                event_class_weights.detach().float(),
+            )
+        else:
+            self.event_class_weights = None
+
+        if pause_pos_weight is not None:
+            self.register_buffer(
+                "pause_pos_weight",
+                torch.tensor([float(pause_pos_weight)]),
+            )
+        else:
+            self.pause_pos_weight = None
+
+        if poss_pos_weight is not None:
+            self.register_buffer(
+                "poss_pos_weight",
+                torch.tensor([float(poss_pos_weight)]),
+            )
+        else:
+            self.poss_pos_weight = None
 
     def forward(
         self,
@@ -153,28 +277,44 @@ class MultiHeadLoss(nn.Module):
         # Sample mask: 1 si la mostra és vàlida per a time/traj (no long pause).
         valid_sample = 1.0 - batch["is_long_pause"]    # [B]
 
-        l_event = event_ce_loss(predictions["event_logits"], batch["phase_target"])
-        l_time  = time_lognormal_nll(
-            predictions["time_mu"], predictions["time_log_sigma"],
+        l_event = event_ce_loss(
+            predictions["event_logits"], batch["phase_target"],
+            class_weights=self.event_class_weights,
+        )
+        l_time  = time_mixture_lognormal_nll(
+            predictions["time_mix_logits"],
+            predictions["time_mu"],
+            predictions["time_log_sigma"],
             batch["delta_proper"], valid_sample,
         )
-        l_pause = pause_bce_loss(predictions["pause_logit"], batch["is_long_pause"])
+        l_pause = pause_bce_loss(
+            predictions["pause_logit"], batch["is_long_pause"],
+            pos_weight=self.pause_pos_weight,
+        )
+        l_poss  = possession_change_bce_loss(
+            predictions["poss_logit"],
+            batch["possession_change"].clamp(min=0.0),    # sentinel −1 → 0 (mascarat)
+            valid_sample,
+            pos_weight=self.poss_pos_weight,
+        )
         l_traj  = trajectory_mse_loss(
             predictions["traj_pred"], batch["target_traj"],
             batch["target_mask"], valid_sample,
         )
 
         total = (
-            self.le * l_event
-          + self.lt * l_time
-          + self.lp * l_pause
-          + self.ls * l_traj
+            self.le  * l_event
+          + self.lt  * l_time
+          + self.lp  * l_pause
+          + self.lpo * l_poss
+          + self.ls  * l_traj
         )
         return {
             "total": total,
             "event": l_event.detach(),
             "time":  l_time.detach(),
             "pause": l_pause.detach(),
+            "poss":  l_poss.detach(),
             "traj":  l_traj.detach(),
         }
 
@@ -209,8 +349,19 @@ def compute_metrics(
     pred_pause = (predictions["pause_logit"].sigmoid() > 0.5).float()
     out["pause_acc"] = (pred_pause == batch["is_long_pause"]).float().mean().item()
 
-    # Time MAE (en segons, usant mediana log-normal = exp(μ))
-    time_pred = predictions["time_mu"].exp()                  # [B]
+    # Possession change accuracy (sobre mostres no long_pause)
+    pred_poss = (predictions["poss_logit"].sigmoid() > 0.5).float()
+    poss_target = batch["possession_change"].clamp(min=0.0)
+    out["poss_acc"] = (
+        ((pred_poss == poss_target).float() * valid_sample).sum() / n_valid_b
+    ).item()
+
+    # Time MAE (en segons, usant la mitjana de la mixture de log-normals)
+    time_pred = mixture_lognormal_mean(
+        predictions["time_mix_logits"],
+        predictions["time_mu"],
+        predictions["time_log_sigma"],
+    )                                                          # [B]
     time_abs_err = (time_pred - batch["delta_proper"]).abs()
     out["time_mae_s"] = ((time_abs_err * valid_sample).sum() / n_valid_b).item()
 
@@ -253,12 +404,16 @@ if __name__ == "__main__":
     def leaf(t: torch.Tensor) -> torch.Tensor:
         return t.detach().requires_grad_(True)
 
+    from .constants import N_TIME_MIXTURE
+    Km = N_TIME_MIXTURE
     predictions = {
-        "event_logits":   leaf(torch.randn(B, N_PHASE_CLASSES)),
-        "time_mu":        leaf(torch.randn(B) * 0.5 + 1.0),
-        "time_log_sigma": leaf(torch.randn(B) * 0.5),
-        "pause_logit":    leaf(torch.randn(B)),
-        "traj_pred":      leaf(torch.randn(B, K, N_NODES, 2) * 30.0),
+        "event_logits":     leaf(torch.randn(B, N_PHASE_CLASSES)),
+        "time_mix_logits":  leaf(torch.zeros(B, Km)),
+        "time_mu":          leaf(torch.linspace(0.5, 2.0, Km).unsqueeze(0).expand(B, Km).clone()),
+        "time_log_sigma":   leaf(torch.full((B, Km), -0.3)),
+        "pause_logit":      leaf(torch.randn(B)),
+        "poss_logit":       leaf(torch.randn(B)),
+        "traj_pred":        leaf(torch.randn(B, K, N_NODES, 2) * 30.0),
     }
     # Cada mostra té un nombre diferent de steps vàlids
     target_mask = torch.zeros(B, K, dtype=torch.bool)
@@ -266,11 +421,12 @@ if __name__ == "__main__":
         target_mask[b, :n] = True
 
     batch = {
-        "phase_target":  torch.randint(0, N_PHASE_CLASSES, (B,)),
-        "delta_proper":  torch.rand(B) * 10.0 + 0.1,
-        "is_long_pause": torch.tensor([0., 0., 0., 1.]),       # b=3 long_pause
-        "target_traj":   torch.randn(B, K, N_NODES, 2) * 30.0,
-        "target_mask":   target_mask,
+        "phase_target":      torch.randint(0, N_PHASE_CLASSES, (B,)),
+        "delta_proper":      torch.rand(B) * 10.0 + 0.1,
+        "is_long_pause":     torch.tensor([0., 0., 0., 1.]),       # b=3 long_pause
+        "possession_change": torch.tensor([0., 1., 0., -1.]),      # b=3 mascarat
+        "target_traj":       torch.randn(B, K, N_NODES, 2) * 30.0,
+        "target_mask":       target_mask,
     }
 
     criterion = MultiHeadLoss()

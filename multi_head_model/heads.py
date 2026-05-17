@@ -29,6 +29,7 @@ from .constants import (
     FPS,
     N_NODES,
     N_PHASE_CLASSES,
+    N_TIME_MIXTURE,
     STRIDE,
     T_PRED_MAX,
 )
@@ -87,31 +88,106 @@ class EventEmbedding(nn.Module):
 
 class TimeHead(nn.Module):
     """
-    Prediu (μ, log σ) d'una distribució log-normal sobre Δt_proper.
-    L'aprenentatge es fa amb NLL log-normal; vegis losses.py.
+    Prediu una *mixture* de K log-normals sobre Δt_proper:
+
+        p(y) = Σ_k  π_k · LogN(y; μ_k, σ_k)
+
+    Output (per cada mostra del batch):
+      - mix_logits : [B, K]  (es passa per softmax per obtenir π_k)
+      - μ          : [B, K]
+      - log σ      : [B, K]  (clipped per estabilitat)
+
+    Inicialització intel·ligent: el biaix de la capa final es prepara perquè
+    el component 0 tendeixi a Δt curt (~2 s) i el component 1 a Δt llarg
+    (~10 s), evitant així el col·lapse a una sola distribució a l'inici.
+
+    L'aprenentatge fa servir la NLL de la mixture (vegis `losses.py`).
     """
 
-    def __init__(self, d_in: int, dropout: float = DROPOUT) -> None:
+    def __init__(
+        self,
+        d_in: int,
+        dropout: float = DROPOUT,
+        n_components: int = N_TIME_MIXTURE,
+    ) -> None:
         super().__init__()
+        self.K = n_components
         self.norm = nn.LayerNorm(d_in)
-        self.mlp  = nn.Sequential(
+        # Sortida: 3 valors per component (mix_logit, μ, log σ)
+        self.mlp = nn.Sequential(
             nn.Linear(d_in, d_in),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_in, 2),    # (μ, log σ)
+            nn.Linear(d_in, 3 * n_components),
         )
+        self._init_biases()
 
-    def forward(self, h_cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out = self.mlp(self.norm(h_cond))            # [B, 2]
-        mu        = out[..., 0]                      # [B]
-        log_sigma = out[..., 1].clamp(LOG_SIGMA_MIN, LOG_SIGMA_MAX)
-        return mu, log_sigma
+    def _init_biases(self) -> None:
+        """
+        Inicialitza el biaix de la darrera Linear perquè els K components
+        partim ja diferenciats:
+          μ_k     = log(linspace(2 s, 10 s, K))
+          log σ_k = log(0.7)   (σ ≈ 0.7, cua moderada)
+          mix_logit_k = 0      (π_k = 1/K uniforme)
+        """
+        K = self.K
+        mu_init = torch.log(torch.linspace(2.0, 10.0, K))
+        log_sigma_init = torch.full((K,), float(torch.log(torch.tensor(0.7))))
+        mix_init = torch.zeros(K)
+
+        # Layout del biaix: [3·K]  ordre intern (mix, μ, σ) per component
+        # Al forward fem .view(*, 3, K) → bias matrix [3, K]:
+        last = self.mlp[-1]   # darrer Linear
+        with torch.no_grad():
+            last.bias.zero_()
+            bias_view = last.bias.view(3, K)
+            bias_view[0] = mix_init
+            bias_view[1] = mu_init
+            bias_view[2] = log_sigma_init
+
+    def forward(
+        self,
+        h_cond: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = self.mlp(self.norm(h_cond))            # [B, 3·K]
+        out = out.view(*out.shape[:-1], 3, self.K)   # [B, 3, K]
+        mix_logits = out[..., 0, :]                  # [B, K]
+        mu         = out[..., 1, :]                  # [B, K]
+        log_sigma  = out[..., 2, :].clamp(LOG_SIGMA_MIN, LOG_SIGMA_MAX)
+        return mix_logits, mu, log_sigma
 
 
 # ── 4. PauseHead ────────────────────────────────────────────────────────────
 
 class PauseHead(nn.Module):
     """Prediu si Δt_proper > cap (long pause / stoppage). Output: logit per BCE."""
+
+    def __init__(self, d_in: int, dropout: float = DROPOUT) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_in)
+        self.mlp  = nn.Sequential(
+            nn.Linear(d_in, d_in // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_in // 2, 1),
+        )
+
+    def forward(self, h_cond: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.norm(h_cond)).squeeze(-1)   # [B]
+
+
+# ── 4b. PossessionChangeHead ────────────────────────────────────────────────
+
+class PossessionChangeHead(nn.Module):
+    """
+    Prediu si entre la fase actual i la propera fase tàctica hi ha canvi
+    de possessió (target binari).
+
+    Output: logit per BCE.
+    Es masquera amb el sample_mask del long_pause (mateix tractament que la
+    TimeHead): quan és long_pause, l'equip de la propera fase és incert i la
+    mostra s'ignora a la pèrdua.
+    """
 
     def __init__(self, d_in: int, dropout: float = DROPOUT) -> None:
         super().__init__()

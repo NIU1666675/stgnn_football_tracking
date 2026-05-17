@@ -4,3 +4,6 @@
 /mds
 /architectures
 .*pdf
+*.ipynb
+/multi_head_output
+*.csv

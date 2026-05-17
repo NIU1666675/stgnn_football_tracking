@@ -39,6 +39,7 @@ from .constants import (
     N_TRAIN_MATCHES,
     N_VAL_MATCHES,
     N_TEST_MATCHES,
+    VAL_T_FRACTIONS,
 )
 from .dataset import PhaseDataset
 from .model   import MultiHeadModel
@@ -139,6 +140,17 @@ def main() -> None:
                         help="Mida del cache LRU de partits per dataset. "
                              "Per defecte = nombre de partits del split (tots "
                              "a RAM, ~200 MB cadascun).")
+    parser.add_argument("--samples-per-phase", type=int, default=3,
+                        help="Nombre de mostres per fase a train (augmentació "
+                             "estocàstica explícita). Cada còpia rebrà un t "
+                             "aleatori independent. No afecta val/test.")
+    parser.add_argument("--no-class-weights", action="store_true",
+                        help="Desactiva el càlcul automàtic de pesos de "
+                             "classe (per a baseline sense pesos).")
+    parser.add_argument("--class-weight-min-count", type=int, default=5,
+                        help="Mínim 'fictici' de mostres per classe en el "
+                             "càlcul de class_weights (per evitar pesos "
+                             "infinits a classes rares).")
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--device",       type=str,   default="auto",
                         choices=["auto", "cpu", "cuda"])
@@ -163,10 +175,30 @@ def main() -> None:
     print(f"[i] Test  ({len(test_dirs)}): {[d.name for d in test_dirs]}")
 
     # ── Datasets / Loaders ────────────────────────────────────────────────
-    train_ds = PhaseDataset(train_dirs, random_t=True,  cache_size=args.cache_size)
-    val_ds   = PhaseDataset(val_dirs,   random_t=False, cache_size=args.cache_size)
-    test_ds  = PhaseDataset(test_dirs,  random_t=False, cache_size=args.cache_size)
+    # Train: random_t (augmentació estocàstica). Si samples_per_phase > 1,
+    # cada fase es replica N vegades amb t aleatoris independents.
+    # Val / Test: multipoint val_t_fractions per cobrir horitzons diversos.
+    train_ds = PhaseDataset(
+        train_dirs,
+        random_t=True,
+        samples_per_phase=args.samples_per_phase,
+        cache_size=args.cache_size,
+    )
+    val_ds = PhaseDataset(
+        val_dirs,
+        random_t=False,
+        val_t_fractions=VAL_T_FRACTIONS,
+        cache_size=args.cache_size,
+    )
+    test_ds = PhaseDataset(
+        test_dirs,
+        random_t=False,
+        val_t_fractions=VAL_T_FRACTIONS,
+        cache_size=args.cache_size,
+    )
     print(f"[i] Mostres: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
+    print(f"[i] Train: samples_per_phase={args.samples_per_phase} → {len(train_ds)//args.samples_per_phase} fases × {args.samples_per_phase}")
+    print(f"[i] Val/test t_fractions: {VAL_T_FRACTIONS}")
 
     # Pre-carrega tots els partits al cache. Així el primer batch no es queda
     # bloquejat carregant JSONL durant minuts sense feedback.
@@ -196,18 +228,54 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=LR_FACTOR, patience=PATIENCE_LR,
     )
-    criterion = MultiHeadLoss()
+
+    # ── Càlcul de pesos de classe sobre el train ───────────────────────────
+    event_cw, pause_pw, poss_pw = None, None, None
+    if not args.no_class_weights:
+        print(f"[i] Calculant pesos de classe sobre el train_ds...")
+        t0 = time.time()
+        stats = train_ds.compute_class_stats(verbose=True)
+        print(f"[i] Estadístiques computades en {time.time()-t0:.1f}s")
+
+        # PauseHead: pos_weight = N_neg / N_pos
+        pause_pw = float(stats["pause"][0]) / max(int(stats["pause"][1]), 1)
+
+        # PossessionChangeHead: pos_weight = N_neg / N_pos
+        poss_pw = float(stats["poss"][0]) / max(int(stats["poss"][1]), 1)
+
+        # EventHead: class_weights = N / (K · n_c), amb clip mínim per estabilitat
+        ev = stats["event"].astype(np.float64)
+        ev_clipped = np.maximum(ev, args.class_weight_min_count)
+        K = len(ev)
+        N = ev.sum()
+        event_cw = torch.tensor(
+            N / (K * ev_clipped), dtype=torch.float32, device=device,
+        )
+        print(f"[i] Pesos finals:")
+        print(f"    pause_pos_weight   = {pause_pw:.2f}")
+        print(f"    poss_pos_weight    = {poss_pw:.2f}")
+        print(f"    event_class_weights= {[round(float(w), 2) for w in event_cw]}")
+    else:
+        print(f"[i] --no-class-weights actiu: cap pes aplicat (baseline pur)")
+
+    criterion = MultiHeadLoss(
+        event_class_weights=event_cw,
+        pause_pos_weight=pause_pw,
+        poss_pos_weight=poss_pw,
+    ).to(device)
 
     # ── CSV logging ────────────────────────────────────────────────────────
     csv_path = out_dir / "train_log.csv"
     log_keys = [
         "epoch", "lr",
-        "train_total", "train_event", "train_time", "train_pause", "train_traj",
-        "train_event_acc", "train_pause_acc", "train_time_mae_s",
-        "train_traj_err_m", "train_final_err_m",
-        "val_total", "val_event", "val_time", "val_pause", "val_traj",
-        "val_event_acc", "val_pause_acc", "val_time_mae_s",
-        "val_traj_err_m", "val_final_err_m",
+        "train_total", "train_event", "train_time", "train_pause",
+        "train_poss", "train_traj",
+        "train_event_acc", "train_pause_acc", "train_poss_acc",
+        "train_time_mae_s", "train_traj_err_m", "train_final_err_m",
+        "val_total", "val_event", "val_time", "val_pause",
+        "val_poss", "val_traj",
+        "val_event_acc", "val_pause_acc", "val_poss_acc",
+        "val_time_mae_s", "val_traj_err_m", "val_final_err_m",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(log_keys)
@@ -232,6 +300,7 @@ def main() -> None:
             f"[{ep:03d}/{args.epochs:03d}] {elapsed:5.1f}s  lr={lr:.1e}  "
             f"train={train_stats['total']:.3f}  val={val_stats['total']:.3f}  "
             f"event_acc={val_stats['event_acc']:.3f}  "
+            f"poss_acc={val_stats['poss_acc']:.3f}  "
             f"time_mae={val_stats['time_mae_s']:.2f}s  "
             f"traj_err={val_stats['traj_err_m']:.2f}m  "
             f"final_err={val_stats['final_err_m']:.2f}m"
