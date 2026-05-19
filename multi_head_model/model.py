@@ -39,13 +39,15 @@ from .encoder import SpatioTemporalEncoder
 from .heads   import (
     EventHead,
     EventEmbedding,
-    TimeHead,
+    # TIMEHEAD_DISABLED:
+    # TimeHead,
     PauseHead,
     PossessionChangeHead,
     TrajectoryHead,
     EVENT_EMB_DIM,
 )
-from .losses  import mixture_lognormal_mean
+# TIMEHEAD_DISABLED:
+# from .losses  import mixture_lognormal_mean
 
 
 # ── Helper: extreure features del frame de predicció ───────────────────────
@@ -81,7 +83,8 @@ class MultiHeadModel(nn.Module):
 
         self.event_head = EventHead(D_MODEL)
         self.event_emb  = EventEmbedding(EVENT_EMB_DIM)
-        self.time_head  = TimeHead(d_cond)
+        # TIMEHEAD_DISABLED:
+        # self.time_head  = TimeHead(d_cond)
         self.pause_head = PauseHead(d_cond)
         self.poss_head  = PossessionChangeHead(d_cond)
         self.traj_head  = TrajectoryHead(d_cond)
@@ -91,10 +94,10 @@ class MultiHeadModel(nn.Module):
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward end-to-end coherent entre entrenament i inferència:
-          - Cap teacher forcing: el TrajectoryHead consumeix sempre
-            time_mu.exp().detach() (predicció del TimeHead, sense propagar
-            gradient cap a aquest head).
+        Forward end-to-end. TIMEHEAD_DISABLED: la cascada Time→Trajectory
+        s'ha eliminat. La TrajectoryHead és independent de qualsevol head
+        temporal i només es condiciona a `h_cond`, `current_pos` i `dt_k`
+        (intern de la head).
         """
         # 1. Encoder → h global
         h = self.encoder(batch)                                    # [B, D]
@@ -106,32 +109,33 @@ class MultiHeadModel(nn.Module):
         emb_event = self.event_emb(event_logits)                   # [B, E]
         h_cond    = torch.cat([h, emb_event], dim=-1)              # [B, D+E]
 
-        # 4. Time / Pause / PossessionChange heads
-        time_mix_logits, time_mu, time_log_sigma = self.time_head(h_cond)
-        # → tots tres tenen forma [B, K], on K = N_TIME_MIXTURE
+        # 4. Pause / PossessionChange heads
+        # TIMEHEAD_DISABLED:
+        # time_mix_logits, time_mu, time_log_sigma = self.time_head(h_cond)
         pause_logit = self.pause_head(h_cond)                      # [B]
         poss_logit  = self.poss_head(h_cond)                       # [B]
 
-        # 5. TrajectoryHead: current_pos al frame t + Δt predit (sense leakage)
+        # 5. TrajectoryHead: current_pos al frame t (sense delta_t global)
         node_numeric = batch["node_numeric"]                       # [B, T, N, 8]
         frame_mask   = batch["frame_mask"]                         # [B, T] bool
         current_pos  = _gather_at_pred_frame(
             node_numeric[..., :2], frame_mask,                     # canals 0,1 = x, y
         )                                                          # [B, N, 2]
 
-        # Predicció puntual del Δt = E[y] de la mixture log-normal.
-        # .detach() impedeix que la trajectory_loss propagi gradient al TimeHead.
-        delta_t = mixture_lognormal_mean(
-            time_mix_logits, time_mu, time_log_sigma,
-        ).detach()                                                 # [B]
+        # TIMEHEAD_DISABLED:
+        # delta_t = mixture_lognormal_mean(
+        #     time_mix_logits, time_mu, time_log_sigma,
+        # ).detach()
+        # traj_pred = self.traj_head(h_cond, current_pos, delta_t)
 
-        traj_pred = self.traj_head(h_cond, current_pos, delta_t)   # [B, T_PRED_MAX, N, 2]
+        traj_pred = self.traj_head(h_cond, current_pos)            # [B, T_PRED_MAX, N, 2]
 
         return {
             "event_logits":    event_logits,
-            "time_mix_logits": time_mix_logits,
-            "time_mu":         time_mu,
-            "time_log_sigma":  time_log_sigma,
+            # TIMEHEAD_DISABLED:
+            # "time_mix_logits": time_mix_logits,
+            # "time_mu":         time_mu,
+            # "time_log_sigma":  time_log_sigma,
             "pause_logit":     pause_logit,
             "poss_logit":      poss_logit,
             "traj_pred":       traj_pred,

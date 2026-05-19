@@ -266,16 +266,17 @@ def main() -> None:
 
     # ── CSV logging ────────────────────────────────────────────────────────
     csv_path = out_dir / "train_log.csv"
+    # TIMEHEAD_DISABLED: hem tret les columnes train_time, val_time, *_time_mae_s.
     log_keys = [
         "epoch", "lr",
-        "train_total", "train_event", "train_time", "train_pause",
+        "train_total", "train_event", "train_pause",
         "train_poss", "train_traj",
         "train_event_acc", "train_pause_acc", "train_poss_acc",
-        "train_time_mae_s", "train_traj_err_m", "train_final_err_m",
-        "val_total", "val_event", "val_time", "val_pause",
+        "train_traj_err_m", "train_final_err_m",
+        "val_total", "val_event", "val_pause",
         "val_poss", "val_traj",
         "val_event_acc", "val_pause_acc", "val_poss_acc",
-        "val_time_mae_s", "val_traj_err_m", "val_final_err_m",
+        "val_traj_err_m", "val_final_err_m",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(log_keys)
@@ -295,13 +296,13 @@ def main() -> None:
         lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_stats["total"])
 
-        # Stdout
+        # Stdout (TIMEHEAD_DISABLED: sense time_mae)
         print(
             f"[{ep:03d}/{args.epochs:03d}] {elapsed:5.1f}s  lr={lr:.1e}  "
             f"train={train_stats['total']:.3f}  val={val_stats['total']:.3f}  "
             f"event_acc={val_stats['event_acc']:.3f}  "
+            f"pause_acc={val_stats['pause_acc']:.3f}  "
             f"poss_acc={val_stats['poss_acc']:.3f}  "
-            f"time_mae={val_stats['time_mae_s']:.2f}s  "
             f"traj_err={val_stats['traj_err_m']:.2f}m  "
             f"final_err={val_stats['final_err_m']:.2f}m"
         )

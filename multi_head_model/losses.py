@@ -281,12 +281,13 @@ class MultiHeadLoss(nn.Module):
             predictions["event_logits"], batch["phase_target"],
             class_weights=self.event_class_weights,
         )
-        l_time  = time_mixture_lognormal_nll(
-            predictions["time_mix_logits"],
-            predictions["time_mu"],
-            predictions["time_log_sigma"],
-            batch["delta_proper"], valid_sample,
-        )
+        # TIMEHEAD_DISABLED:
+        # l_time  = time_mixture_lognormal_nll(
+        #     predictions["time_mix_logits"],
+        #     predictions["time_mu"],
+        #     predictions["time_log_sigma"],
+        #     batch["delta_proper"], valid_sample,
+        # )
         l_pause = pause_bce_loss(
             predictions["pause_logit"], batch["is_long_pause"],
             pos_weight=self.pause_pos_weight,
@@ -304,7 +305,8 @@ class MultiHeadLoss(nn.Module):
 
         total = (
             self.le  * l_event
-          + self.lt  * l_time
+          # TIMEHEAD_DISABLED:
+          # + self.lt  * l_time
           + self.lp  * l_pause
           + self.lpo * l_poss
           + self.ls  * l_traj
@@ -312,7 +314,8 @@ class MultiHeadLoss(nn.Module):
         return {
             "total": total,
             "event": l_event.detach(),
-            "time":  l_time.detach(),
+            # TIMEHEAD_DISABLED:
+            # "time":  l_time.detach(),
             "pause": l_pause.detach(),
             "poss":  l_poss.detach(),
             "traj":  l_traj.detach(),
@@ -356,14 +359,15 @@ def compute_metrics(
         ((pred_poss == poss_target).float() * valid_sample).sum() / n_valid_b
     ).item()
 
-    # Time MAE (en segons, usant la mitjana de la mixture de log-normals)
-    time_pred = mixture_lognormal_mean(
-        predictions["time_mix_logits"],
-        predictions["time_mu"],
-        predictions["time_log_sigma"],
-    )                                                          # [B]
-    time_abs_err = (time_pred - batch["delta_proper"]).abs()
-    out["time_mae_s"] = ((time_abs_err * valid_sample).sum() / n_valid_b).item()
+    # TIMEHEAD_DISABLED:
+    # # Time MAE (en segons, usant la mitjana de la mixture de log-normals)
+    # time_pred = mixture_lognormal_mean(
+    #     predictions["time_mix_logits"],
+    #     predictions["time_mu"],
+    #     predictions["time_log_sigma"],
+    # )                                                          # [B]
+    # time_abs_err = (time_pred - batch["delta_proper"]).abs()
+    # out["time_mae_s"] = ((time_abs_err * valid_sample).sum() / n_valid_b).item()
 
     # Trajectory error (distància euclidiana mitjana, en metres)
     diff = predictions["traj_pred"] - batch["target_traj"]   # [B, K, N, 2]
@@ -404,13 +408,9 @@ if __name__ == "__main__":
     def leaf(t: torch.Tensor) -> torch.Tensor:
         return t.detach().requires_grad_(True)
 
-    from .constants import N_TIME_MIXTURE
-    Km = N_TIME_MIXTURE
+    # TIMEHEAD_DISABLED: les claus time_* ja no formen part de l'output.
     predictions = {
         "event_logits":     leaf(torch.randn(B, N_PHASE_CLASSES)),
-        "time_mix_logits":  leaf(torch.zeros(B, Km)),
-        "time_mu":          leaf(torch.linspace(0.5, 2.0, Km).unsqueeze(0).expand(B, Km).clone()),
-        "time_log_sigma":   leaf(torch.full((B, Km), -0.3)),
         "pause_logit":      leaf(torch.randn(B)),
         "poss_logit":       leaf(torch.randn(B)),
         "traj_pred":        leaf(torch.randn(B, K, N_NODES, 2) * 30.0),

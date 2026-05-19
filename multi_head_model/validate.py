@@ -73,7 +73,8 @@ def collect_predictions(model, loader, device) -> Dict[str, np.ndarray]:
     model.eval()
     chunks: Dict[str, List[np.ndarray]] = {
         "event_logits": [], "phase_target": [],
-        "time_mix_logits": [], "time_mu": [], "time_log_sigma": [],
+        # TIMEHEAD_DISABLED:
+        # "time_mix_logits": [], "time_mu": [], "time_log_sigma": [],
         "delta_proper": [],
         "pause_logit": [], "is_long_pause": [],
         "poss_logit": [], "possession_change": [],
@@ -83,8 +84,8 @@ def collect_predictions(model, loader, device) -> Dict[str, np.ndarray]:
     for batch in loader:
         batch_d = to_device(batch, device)
         preds = model(batch_d)
-        for k in ("event_logits", "time_mix_logits",
-                  "time_mu", "time_log_sigma",
+        # TIMEHEAD_DISABLED: time_mix_logits/time_mu/time_log_sigma ja no existeixen.
+        for k in ("event_logits",
                   "pause_logit", "poss_logit", "traj_pred"):
             chunks[k].append(preds[k].cpu().numpy())
         for k in ("phase_target", "delta_proper", "is_long_pause",
@@ -144,57 +145,59 @@ def plot_confusion_event(data, out_path: Path):
 
 
 # ── 2. Calibració del Time head ─────────────────────────────────────────────
-
-def _mixture_mean_np(mix_logits, mu, log_sigma):
-    """Implementació NumPy de mixture_lognormal_mean."""
-    # mix_logits, mu, log_sigma: [N, K]
-    pi = np.exp(mix_logits - mix_logits.max(axis=-1, keepdims=True))
-    pi = pi / pi.sum(axis=-1, keepdims=True)
-    sigma2 = np.exp(2.0 * log_sigma)
-    mean_per_k = np.exp(mu + 0.5 * sigma2)
-    return (pi * mean_per_k).sum(axis=-1)
-
-
-def plot_time_calibration(data, out_path: Path):
-    valid = data["is_long_pause"] == 0
-    real = data["delta_proper"][valid]
-    # Predicció puntual = mitjana de la mixture
-    pred = _mixture_mean_np(
-        data["time_mix_logits"][valid],
-        data["time_mu"][valid],
-        data["time_log_sigma"][valid],
-    )
-
-    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-    fig.patch.set_facecolor(BG)
-
-    # Scatter
-    ax = axs[0]
-    _style(ax)
-    ax.scatter(real, pred, s=12, c="#42a5f5", alpha=0.5, edgecolor="none")
-    mx = max(real.max(), pred.max())
-    ax.plot([0, mx], [0, mx], color="#ffeb3b", lw=1, ls="--",
-            label="predicció perfecta")
-    ax.set_xlabel("Δt real (s)", color=FG)
-    ax.set_ylabel("Δt predit = exp(μ) (s)", color=FG)
-    ax.set_title(f"Calibració temporal  ·  N={valid.sum()} mostres",
-                 color=FG, fontweight="bold")
-    ax.legend(facecolor="#1a1a1a", labelcolor=FG, fontsize=8)
-    ax.set_xlim(0, mx*1.05); ax.set_ylim(0, mx*1.05)
-
-    # Histogrames superposats
-    ax = axs[1]
-    _style(ax)
-    bins = np.linspace(0, max(real.max(), pred.max()), 40)
-    ax.hist(real, bins=bins, alpha=0.55, color="#42a5f5", label="real")
-    ax.hist(pred, bins=bins, alpha=0.55, color="#ef5350", label="predit")
-    ax.set_xlabel("Δt (s)", color=FG); ax.set_ylabel("freqüència", color=FG)
-    ax.set_title("Distribució de Δt", color=FG, fontweight="bold")
-    ax.legend(facecolor="#1a1a1a", labelcolor=FG, fontsize=8)
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=BG)
-    print(f"[OK] {out_path}")
+# TIMEHEAD_DISABLED: aquest plot i el helper auxiliar s'han eliminat perquè
+# el TimeHead ja no forma part del model.
+#
+# def _mixture_mean_np(mix_logits, mu, log_sigma):
+#     """Implementació NumPy de mixture_lognormal_mean."""
+#     # mix_logits, mu, log_sigma: [N, K]
+#     pi = np.exp(mix_logits - mix_logits.max(axis=-1, keepdims=True))
+#     pi = pi / pi.sum(axis=-1, keepdims=True)
+#     sigma2 = np.exp(2.0 * log_sigma)
+#     mean_per_k = np.exp(mu + 0.5 * sigma2)
+#     return (pi * mean_per_k).sum(axis=-1)
+#
+#
+# def plot_time_calibration(data, out_path: Path):
+#     valid = data["is_long_pause"] == 0
+#     real = data["delta_proper"][valid]
+#     # Predicció puntual = mitjana de la mixture
+#     pred = _mixture_mean_np(
+#         data["time_mix_logits"][valid],
+#         data["time_mu"][valid],
+#         data["time_log_sigma"][valid],
+#     )
+#
+#     fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+#     fig.patch.set_facecolor(BG)
+#
+#     # Scatter
+#     ax = axs[0]
+#     _style(ax)
+#     ax.scatter(real, pred, s=12, c="#42a5f5", alpha=0.5, edgecolor="none")
+#     mx = max(real.max(), pred.max())
+#     ax.plot([0, mx], [0, mx], color="#ffeb3b", lw=1, ls="--",
+#             label="predicció perfecta")
+#     ax.set_xlabel("Δt real (s)", color=FG)
+#     ax.set_ylabel("Δt predit = exp(μ) (s)", color=FG)
+#     ax.set_title(f"Calibració temporal  ·  N={valid.sum()} mostres",
+#                  color=FG, fontweight="bold")
+#     ax.legend(facecolor="#1a1a1a", labelcolor=FG, fontsize=8)
+#     ax.set_xlim(0, mx*1.05); ax.set_ylim(0, mx*1.05)
+#
+#     # Histogrames superposats
+#     ax = axs[1]
+#     _style(ax)
+#     bins = np.linspace(0, max(real.max(), pred.max()), 40)
+#     ax.hist(real, bins=bins, alpha=0.55, color="#42a5f5", label="real")
+#     ax.hist(pred, bins=bins, alpha=0.55, color="#ef5350", label="predit")
+#     ax.set_xlabel("Δt (s)", color=FG); ax.set_ylabel("freqüència", color=FG)
+#     ax.set_title("Distribució de Δt", color=FG, fontweight="bold")
+#     ax.legend(facecolor="#1a1a1a", labelcolor=FG, fontsize=8)
+#
+#     plt.tight_layout()
+#     plt.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=BG)
+#     print(f"[OK] {out_path}")
 
 
 # ── 3. Distribució del pause logit ──────────────────────────────────────────
@@ -325,17 +328,18 @@ def plot_trajectories(data, out_path: Path, n_samples: int = 6, seed: int = 0):
                     "x", color="#FF9800", ms=6, mew=1.5, zorder=3)
 
         dt_real = data["delta_proper"][idx]
-        dt_pred = float(_mixture_mean_np(
-            data["time_mix_logits"][idx:idx+1],
-            data["time_mu"][idx:idx+1],
-            data["time_log_sigma"][idx:idx+1],
-        )[0])
+        # TIMEHEAD_DISABLED: ja no podem mostrar el Δt predit.
+        # dt_pred = float(_mixture_mean_np(
+        #     data["time_mix_logits"][idx:idx+1],
+        #     data["time_mu"][idx:idx+1],
+        #     data["time_log_sigma"][idx:idx+1],
+        # )[0])
         ev_real = PHASE_TYPES[int(data["phase_target"][idx])]
         ev_pred = PHASE_TYPES[int(data["event_logits"][idx].argmax())]
         # Error mig sobre els steps vàlids
         err = np.sqrt(((pred[:n_pred] - target[:n_pred])**2).sum(-1)).mean()
         ax.set_title(
-            f"idx={idx}  ·  Δt: real {dt_real:.1f}s / pred {dt_pred:.1f}s\n"
+            f"idx={idx}  ·  Δt_real {dt_real:.1f}s\n"
             f"event: real '{ev_real}' / pred '{ev_pred}'  ·  err: {err:.2f} m",
             color=FG, fontsize=9,
         )
@@ -442,7 +446,8 @@ def main():
     print(f"[i] Fet. Generant figures a {fig_dir}/")
 
     plot_confusion_event(data,           fig_dir / "confusion_matrix_event.png")
-    plot_time_calibration(data,          fig_dir / "time_calibration.png")
+    # TIMEHEAD_DISABLED:
+    # plot_time_calibration(data,          fig_dir / "time_calibration.png")
     plot_pause_distribution(data,        fig_dir / "pause_distribution.png")
     plot_possession_distribution(data,   fig_dir / "possession_distribution.png")
     plot_trajectories(data,              fig_dir / "trajectory_examples.png")
