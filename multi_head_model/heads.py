@@ -219,24 +219,34 @@ class TrajectoryHead(nn.Module):
     Prediu, per cada node v i cada step k ∈ {1, ..., T_PRED_MAX}, la posició
     (x, y) corresponent al moment t + k · PRED_STEP_S segons.
 
-    Internament aprèn el **desplaçament** Δpos respecte a current_pos:
-        traj_pred[b, k, n] = current_pos[b, n] + MLP(...)
+    Pipeline intern:
 
-    La MLP és **compartida** entre tots els steps i nodes; el que canvia és
-    el seu input. Per cada (b, k, n) rep:
+        feat = [h_cond, current_pos, dt_k]
+                  ↓
+                 MLP                      step-a-step, independent
+                  ↓
+               Δpos_pre  [B, K, N, 2]
+                  ↓
+        Conv1d temporal sobre K           barreja steps veïns
+                  ↓
+               Δpos_post [B, K, N, 2]
+                  ↓
+        traj_pred = current_pos + Δpos_post
 
-        [h_cond[b], current_pos[b,n], dt_k[k]]
-            ↑              ↑              ↑
-       context global   posició a t   "edat" del step k (k · 0,3 s)
+    La MLP és compartida entre tots els steps i nodes (predicció
+    independent per step). La Conv1d temporal actua com a refinador que
+    força coherència entre steps consecutius, esmorteint dents de serra
+    físicament inviables. S'inicialitza com a identitat perquè al
+    començament de l'entrenament `Δpos_post ≈ Δpos_pre` i la conv aprengui
+    gradualment quan suavitzar.
 
-    TIMEHEAD_DISABLED: anteriorment es passava també `delta_t` (predit pel
-    TimeHead), però aquest condicionament global era font de mismatch i ha
-    estat eliminat. Ara la TrajectoryHead és independent de qualsevol altra
-    head temporal.
+    TIMEHEAD_DISABLED: la TrajectoryHead no rep `delta_t` global del
+    TimeHead; el dt_k local de cada step ja conté tota la informació
+    temporal necessària.
 
     Forma de la sortida: [B, T_PRED_MAX, N, 2]   (posicions absolutes).
-    Els steps que cauen més enllà de Δt_proper són emmascarats per
-    target_mask del dataset i no contribueixen a la pèrdua.
+    Els steps fora de l'horitzó vàlid són emmascarats per target_mask del
+    dataset i no contribueixen a la pèrdua.
     """
 
     def __init__(
@@ -244,6 +254,7 @@ class TrajectoryHead(nn.Module):
         d_in: int,
         hidden: int = 128,
         dropout: float = DROPOUT,
+        temporal_kernel: int = 5,
     ) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(d_in)
@@ -255,9 +266,37 @@ class TrajectoryHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden // 2, 2),
         )
+        # Conv1d temporal: suavitza Δpos sobre l'eix dels steps. Cada canal
+        # (x o y) es processa independent però amb mateix kernel. Padding
+        # "same" perquè la longitud K es conservi.
+        assert temporal_kernel % 2 == 1, "temporal_kernel ha de ser senar"
+        self.temporal_conv = nn.Conv1d(
+            in_channels=2, out_channels=2,
+            kernel_size=temporal_kernel,
+            padding=temporal_kernel // 2,
+        )
+        self._init_temporal_conv_as_identity()
+
         # dt_k[k] = (k+1) * PRED_STEP_S, k ∈ {0, ..., T_PRED_MAX-1}
         dt_k = torch.arange(1, T_PRED_MAX + 1, dtype=torch.float32) * PRED_STEP_S
         self.register_buffer("dt_k", dt_k)              # [T_PRED_MAX]
+
+    def _init_temporal_conv_as_identity(self) -> None:
+        """
+        Inicialitza la conv1d perquè actuï com a identitat: el step central
+        del kernel té pes 1 (en el canal corresponent) i la resta 0. Així
+        a l'inici de l'entrenament Δpos_post ≈ Δpos_pre i la xarxa parteix
+        del mateix punt que sense conv. Durant l'entrenament la conv pot
+        aprendre a desviar-se de la identitat si necessita suavitzar.
+        """
+        K = self.temporal_conv.kernel_size[0]
+        center = K // 2
+        with torch.no_grad():
+            self.temporal_conv.weight.zero_()
+            for c in range(self.temporal_conv.out_channels):
+                # weight[out_c, in_c, t]: identitat = δ_{out_c, in_c} · δ_{t, center}
+                self.temporal_conv.weight[c, c, center] = 1.0
+            self.temporal_conv.bias.zero_()
 
     def forward(
         self,
@@ -280,6 +319,16 @@ class TrajectoryHead(nn.Module):
 
         feat = torch.cat([h_exp, pos_exp, dt_k_exp], dim=-1)                 # [B,K,N,d_in+3]
         delta_pos = self.mlp(feat)                                            # [B, K, N, 2]
+
+        # ── Conv1d temporal sobre l'eix K ───────────────────────────────────
+        # Reorganitzem a [B*N, 2, K] perquè Conv1d treballa amb format
+        # (batch, channels, length): aquí "batch" agrupa cada (mostra, node)
+        # i "length" és l'eix temporal dels K steps. Així cada node és
+        # processat independent però la conv barreja steps veïns.
+        d_in_conv  = delta_pos.permute(0, 2, 3, 1).reshape(B * N, 2, K)       # [B*N, 2, K]
+        d_out_conv = self.temporal_conv(d_in_conv)                            # [B*N, 2, K]
+        delta_pos  = d_out_conv.view(B, N, 2, K).permute(0, 3, 1, 2)          # [B, K, N, 2]
+
         return pos_exp + delta_pos                                            # [B, K, N, 2]
 
 
