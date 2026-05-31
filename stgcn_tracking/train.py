@@ -2,8 +2,9 @@
 Training script for STGCN football tracking.
 
 Usage:
-    python -m stgcn_tracking.train                     # variant estàtica
-    python -m stgcn_tracking.train --dynamic           # variant signada/dinàmica
+    python -m stgcn_tracking.train                     # variant estàtica, features base
+    python -m stgcn_tracking.train --dynamic           # variant signada/dinàmica, features v2
+    python -m stgcn_tracking.train --dynamic --features v3   # variant dinàmica amb V3
     python -m stgcn_tracking.train --epochs 100 --batch-size 64
 """
 
@@ -19,8 +20,47 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from stgcn_tracking import constants as C
-from stgcn_tracking.Dataset import TrackingDataset, TrackingDatasetV2
-from stgcn_tracking.model import build_model, build_model_dynamic
+from stgcn_tracking.Dataset import (
+    TrackingDataset, TrackingDatasetV2, TrackingDatasetV3,
+)
+from stgcn_tracking.model import (
+    build_model, build_model_v2, build_model_v3, build_model_dynamic,
+    N_FEAT_V2, N_FEAT_V3,
+)
+
+
+# ── Configuració de features ────────────────────────────────────────────────
+# Mapeja la clau de la línia de comandes a (classe de dataset, nombre de canals
+# d'entrada del model). Les claus segueixen la convenció dels datasets.
+
+FEATURES_TO_DATASET = {
+    "base": TrackingDataset,        # [x, y]
+    "v2":   TrackingDatasetV2,      # + (vx, vy, dx_ball, dy_ball)
+    "v3":   TrackingDatasetV3,      # + (dvx_ball, dvy_ball)
+}
+FEATURES_TO_CIN = {
+    "base": C.N_FEAT,    # 2
+    "v2":   N_FEAT_V2,   # 6
+    "v3":   N_FEAT_V3,   # 8
+}
+
+
+def default_features(dynamic: bool) -> str:
+    """Default features per variant, per preservar el comportament històric."""
+    return "v2" if dynamic else "base"
+
+
+def output_dirname(variant: str, features: str) -> str:
+    """
+    Backward-compatible: si la combinació és la històrica per defecte, manté
+    el nom original (stgcn_static / stgcn_dynamic). Altrament hi afegeix
+    el sufix de features per evitar sobreescriure.
+    """
+    if variant == "static" and features == "base":
+        return "stgcn_static"
+    if variant == "dynamic" and features == "v2":
+        return "stgcn_dynamic"
+    return f"stgcn_{variant}_{features}"
 
 
 # ── Hyperparàmetres per defecte ─────────────────────────────────────────────
@@ -105,16 +145,25 @@ def run_epoch(model, loader, criterion, device, mean_std,
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[i] Device: {device}")
-    print(f"[i] Variant: {'dynamic (signed)' if args.dynamic else 'static'}")
 
-    # Directori de sortida específic per variant
-    variant = "dynamic" if args.dynamic else "static"
-    out_dir = Path(args.out_dir) / f"stgcn_{variant}"
+    # ── Resolució de la configuració de features ──────────────────────────
+    features = args.features if args.features is not None else default_features(args.dynamic)
+    if features not in FEATURES_TO_DATASET:
+        raise ValueError(f"--features={features} desconegut; opcions: "
+                         f"{list(FEATURES_TO_DATASET)}")
+
+    variant   = "dynamic" if args.dynamic else "static"
+    DatasetCls = FEATURES_TO_DATASET[features]
+    c_in       = FEATURES_TO_CIN[features]
+    print(f"[i] Variant:  {'dynamic (signed)' if args.dynamic else 'static'}")
+    print(f"[i] Features: {features}  (c_in={c_in}, dataset={DatasetCls.__name__})")
+
+    # Directori de sortida específic per variant + features
+    out_dir = Path(args.out_dir) / output_dirname(variant, features)
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[i] Sortida: {out_dir}")
+    print(f"[i] Sortida:  {out_dir}")
 
     # ── Dades ──────────────────────────────────────────────────────────────
-    DatasetCls = TrackingDatasetV2 if args.dynamic else TrackingDataset
     train_loader = DataLoader(
         DatasetCls("seq_train.npy"),
         batch_size=args.batch_size, shuffle=True,
@@ -135,10 +184,16 @@ def train(args):
           f"val={len(val_loader.dataset)} test={len(test_loader.dataset)}")
 
     # ── Model + opt + scheduler + loss ─────────────────────────────────────
-    model = (
-        build_model_dynamic(device, c_in=6) if args.dynamic
-        else build_model(device)
-    )
+    if args.dynamic:
+        model = build_model_dynamic(device, c_in=c_in)
+    else:
+        # Static: tria el helper amb c_in cablejat segons les features.
+        static_builder = {
+            "base": build_model,
+            "v2":   build_model_v2,
+            "v3":   build_model_v3,
+        }[features]
+        model = static_builder(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
@@ -248,9 +303,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dynamic",      action="store_true",
                         help="Entrena la variant signada/dinàmica.")
+    parser.add_argument("--features",     type=str,   default=None,
+                        choices=list(FEATURES_TO_DATASET),
+                        help="Features d'entrada del model. "
+                             "Per defecte: 'base' per a static, 'v2' per a "
+                             "dynamic. 'v3' afegeix velocitat relativa a la "
+                             "pilota.")
     parser.add_argument("--out-dir",      type=str,   default=C.OUTPUT_DIR,
                         help="Directori arrel de sortides (s'hi crea un "
-                             "subdirectori stgcn_static/ o stgcn_dynamic/).")
+                             "subdirectori stgcn_{variant}[_features]/).")
     parser.add_argument("--epochs",       type=int,   default=EPOCHS)
     parser.add_argument("--batch-size",   type=int,   default=BATCH_SIZE)
     parser.add_argument("--lr",           type=float, default=LR)

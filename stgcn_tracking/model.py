@@ -76,6 +76,7 @@ class STGCN(nn.Module):
 
 
 N_FEAT_V2 = 6  # x, y, vx, vy, dx_ball, dy_ball
+N_FEAT_V3 = 8  # + dvx_ball, dvy_ball  (velocitat relativa a la pilota)
 
 # ── Graf signat + dinàmic ────────────────────────────────────────────────────
 
@@ -231,4 +232,16 @@ def build_model_v2(device: torch.device) -> STGCN:
     Lk_np = np.load(os.path.join(C.OUTPUT_DIR, 'Lk_chebyshev.npy'))
     Lk = torch.tensor(Lk_np, dtype=torch.float32, device=device)
     model = STGCN(Lk=Lk, c_in=N_FEAT_V2).to(device)
+    return model
+
+
+def build_model_v3(device: torch.device) -> STGCN:
+    """
+    Igual que build_model però amb c_in=8 per acceptar les features
+    ampliades de TrackingDatasetV3:
+    [x, y, vx, vy, dx_ball, dy_ball, dvx_ball, dvy_ball].
+    """
+    Lk_np = np.load(os.path.join(C.OUTPUT_DIR, 'Lk_chebyshev.npy'))
+    Lk = torch.tensor(Lk_np, dtype=torch.float32, device=device)
+    model = STGCN(Lk=Lk, c_in=N_FEAT_V3).to(device)
     return model
