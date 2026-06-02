@@ -4,16 +4,16 @@ Encoder espai-temporal per al model multi-head.
 Pipeline:
     [B, T, N, 8]  node_numeric   ─┐
     [B, N]        position_idx ───┤  →  Embedding + concat amb context
-    [B, T, 15]    context ────────┘     →  Linear → [B, T, N, D]
+    [B, T, 15]    context ────────┘     →  Linear → [B,T,N,31]→ [B, T, N, D]
                                               ↓
-                          ┌── per cada layer (×N_LAYERS) ──┐
+                          ┌── per cada layer (x N_LAYERS) ──┐
                           │   R-GCN espacial (per frame)   │
                           │   Transformer temporal (per node) │
                           └────────────────────────────────┘
                                               ↓
                           BallWeightedPool (frame de predicció +
-                                              mitjana ponderada per
-                                              distància a la pilota)
+                                              mitjana ponderada amb kernel gaussià
+                                                per distància a la pilota)
                                               ↓
                                      h_global  ∈ [B, D]
 """
@@ -30,6 +30,7 @@ from .constants import (
     N_NODE_NUMERIC_FEAT,
     N_CONTEXT_FEAT,
     N_EVENT_TYPES,
+    N_NODES,
     POSITION_VOCAB_SIZE,
     POSITION_EMBED_DIM,
     D_MODEL,
@@ -38,6 +39,10 @@ from .constants import (
     DROPOUT,
     SPATIAL_SIGMA,
 )
+
+
+# Identifier del node de la pilota (última ranura).
+BALL_IDX = N_NODES - 1
 
 
 # ── 1. Projecció d'entrada ─────────────────────────────────────────────────
@@ -214,11 +219,92 @@ class BallWeightedPool(nn.Module):
         return (h_t * w.unsqueeze(-1)).sum(dim=1)                            # [B, D]
 
 
+# ── 4b. AttentionPool: alternativa modular al BallWeightedPool ─────────────
+
+class AttentionPool(nn.Module):
+    """
+    Pooling per atenció amb la pilota com a *query*.
+
+    Manté el mateix contracte que BallWeightedPool (mateixos inputs i output),
+    de manera que es pot intercanviar sense tocar la resta del pipeline:
+
+      1) Selecciona el frame de predicció (últim frame vàlid de cada mostra).
+      2) Pren les features del node de la pilota com a query.
+      3) Calcula pesos d'atenció scaled dot-product sobre els N nodes
+         (inclosa la pilota mateixa) i agrega els seus values.
+
+    Es manté un sol cap d'atenció per evitar sobreparametritzar amb un
+    dataset modest. Si convé escalar, n'hi ha prou amb fer més caps.
+
+    Inputs:
+      x:            [B, T, N, D]
+      node_numeric: [B, T, N, 8]   (ignorat; mantenim la signatura per
+                                    intercanviabilitat amb BallWeightedPool)
+      frame_mask:   [B, T] bool
+
+    Output:
+      h_global:     [B, D]
+    """
+
+    def __init__(self, d_model: int = D_MODEL) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.scale   = float(d_model) ** -0.5
+        self.q_proj  = nn.Linear(d_model, d_model)
+        self.k_proj  = nn.Linear(d_model, d_model)
+        self.v_proj  = nn.Linear(d_model, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        node_numeric: torch.Tensor,   # noqa: ARG002 (intercanviabilitat)
+        frame_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        B, T, N, D = x.shape
+        device = x.device
+
+        # Últim frame vàlid per mostra
+        t_range = torch.arange(T, device=device)
+        idx_t = (frame_mask.long() * t_range).argmax(dim=1)                  # [B]
+
+        idx_h = idx_t.view(B, 1, 1, 1).expand(B, 1, N, D)
+        h_t   = torch.gather(x, 1, idx_h).squeeze(1)                         # [B, N, D]
+
+        # Query = features de la pilota; keys/values = tots els nodes
+        h_ball = h_t[:, BALL_IDX, :]                                          # [B, D]
+        q = self.q_proj(h_ball).unsqueeze(1)                                 # [B, 1, D]
+        k = self.k_proj(h_t)                                                  # [B, N, D]
+        v = self.v_proj(h_t)                                                  # [B, N, D]
+
+        attn_logits = (q @ k.transpose(-1, -2)).squeeze(1) * self.scale       # [B, N]
+        attn        = torch.softmax(attn_logits, dim=-1)                      # [B, N]
+        return (attn.unsqueeze(-1) * v).sum(dim=1)                            # [B, D]
+
+
 # ── 5. Encoder complet ─────────────────────────────────────────────────────
+
+POOL_TYPES = ("ball-weighted", "attention")
+
+
+def _build_pool(pool_type: str, d_model: int, sigma: float) -> nn.Module:
+    """Factoria del mòdul de pooling segons la clau seleccionada."""
+    if pool_type == "ball-weighted":
+        return BallWeightedPool(sigma=sigma)
+    if pool_type == "attention":
+        return AttentionPool(d_model=d_model)
+    raise ValueError(
+        f"pool_type='{pool_type}' desconegut; opcions: {POOL_TYPES}"
+    )
+
 
 class SpatioTemporalEncoder(nn.Module):
     """
     Encoder que retorna un únic vector h ∈ R^D per mostra.
+
+    El mòdul de pooling final és intercanviable via `pool_type`:
+      - 'ball-weighted' (per defecte): mitjana ponderada amb kernel
+        gaussià centrat a la pilota; sigma fixat per `ball_pool_sigma`.
+      - 'attention': pooling per atenció amb la pilota com a query.
     """
 
     def __init__(
@@ -228,6 +314,7 @@ class SpatioTemporalEncoder(nn.Module):
         n_heads:  int  = N_HEADS,
         dropout:  float = DROPOUT,
         ball_pool_sigma: float = SPATIAL_SIGMA,
+        pool_type: str = "ball-weighted",
     ) -> None:
         super().__init__()
         self.input_proj = InputProjection()
@@ -235,7 +322,8 @@ class SpatioTemporalEncoder(nn.Module):
             EncoderBlock(d_model, n_heads, dropout) for _ in range(n_layers)
         ])
         self.norm_out = nn.LayerNorm(d_model)
-        self.pool     = BallWeightedPool(sigma=ball_pool_sigma)
+        self.pool     = _build_pool(pool_type, d_model, ball_pool_sigma)
+        self.pool_type = pool_type
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         node_numeric = batch["node_numeric"]

@@ -70,14 +70,22 @@ def _gather_at_pred_frame(x: torch.Tensor, frame_mask: torch.Tensor) -> torch.Te
 class MultiHeadModel(nn.Module):
     """
     Encoder + 4 heads en cascada. Comparteixen `h_cond = concat(h, emb_event)`.
+
+    El mòdul de pooling de l'encoder és intercanviable via `pool_type`:
+      - 'ball-weighted' (per defecte): kernel gaussià centrat a la pilota.
+      - 'attention': pooling per atenció amb la pilota com a query.
     """
 
     def __init__(
         self,
         ball_pool_sigma: float = SPATIAL_SIGMA,
+        pool_type: str = "ball-weighted",
     ) -> None:
         super().__init__()
-        self.encoder = SpatioTemporalEncoder(ball_pool_sigma=ball_pool_sigma)
+        self.encoder = SpatioTemporalEncoder(
+            ball_pool_sigma=ball_pool_sigma,
+            pool_type=pool_type,
+        )
 
         d_cond = D_MODEL + EVENT_EMB_DIM
 

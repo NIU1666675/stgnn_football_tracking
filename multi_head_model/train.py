@@ -151,6 +151,12 @@ def main() -> None:
                         help="Mínim 'fictici' de mostres per classe en el "
                              "càlcul de class_weights (per evitar pesos "
                              "infinits a classes rares).")
+    parser.add_argument("--pool",         type=str,   default="ball-weighted",
+                        choices=["ball-weighted", "attention"],
+                        help="Mòdul de pooling de l'encoder. "
+                             "'ball-weighted' (per defecte): kernel gaussià "
+                             "centrat a la pilota. 'attention': pooling per "
+                             "atenció amb la pilota com a query.")
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--device",       type=str,   default="auto",
                         choices=["auto", "cpu", "cuda"])
@@ -219,7 +225,8 @@ def main() -> None:
     test_loader  = DataLoader(test_ds,  shuffle=False, **loader_kw)
 
     # ── Model / Optimitzador / Scheduler / Loss ───────────────────────────
-    model = MultiHeadModel().to(device)
+    model = MultiHeadModel(pool_type=args.pool).to(device)
+    print(f"[i] Pool: {args.pool}")
     print(f"[i] Paràmetres: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(
