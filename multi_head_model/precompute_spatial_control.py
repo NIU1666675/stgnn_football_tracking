@@ -78,11 +78,16 @@ def _frame_players(
         team = match.player_team.get(pid)
         if team is None:
             continue
+        if not np.all(np.isfinite([x, y])):
+            continue
         team_idx = 0 if team == match.home_team_id else 1
 
         if prev_players is not None and pid in prev_players:
             px, py, _ = prev_players[pid]
-            vx, vy = (x - px) / DT_STEP_S, (y - py) / DT_STEP_S
+            if np.all(np.isfinite([px, py])):
+                vx, vy = (x - px) / DT_STEP_S, (y - py) / DT_STEP_S
+            else:
+                vx, vy = 0.0, 0.0
         else:
             vx, vy = 0.0, 0.0
 
@@ -95,7 +100,11 @@ def _frame_players(
         return None
 
     ball = data.get("ball")
-    ball_xy = np.array([float(ball[0]), float(ball[1])]) if ball is not None else None
+    ball_xy = (
+        np.array([float(ball[0]), float(ball[1])])
+        if ball is not None and np.all(np.isfinite(ball[:2]))
+        else None
+    )
 
     return (
         np.asarray(pos_list, dtype=np.float64),
@@ -194,8 +203,12 @@ def validate_artifact(frames_dict: Dict[int, dict], match_id: str) -> None:
     print(f"    third_home dins [0,1]: "
           f"{'OK' if (third_vals.min() >= -1e-6 and third_vals.max() <= 1+1e-6) else 'FORA DE RANG'}"
           f"  (min={third_vals.min():.3f} max={third_vals.max():.3f})")
+    if not np.all(np.isfinite(all_areas)):
+        raise ValueError(f"{match_id}: area_frac conté NaN o inf.")
     if n_nan_third:
-        print(f"    [!] {n_nan_third} frames amb third_home no finit")
+        raise ValueError(
+            f"{match_id}: {n_nan_third} frames amb third_home no finit."
+        )
     if n_nan_ballzone:
         print(f"    [i] {n_nan_ballzone} frames sense pilota (ball_zone=NaN)")
 

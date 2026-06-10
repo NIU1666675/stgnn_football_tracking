@@ -337,6 +337,14 @@ class SpatioTemporalEncoder(nn.Module):
         adj          = batch["adj_per_relation"]
         frame_mask   = batch["frame_mask"]
 
+        empty_samples = ~frame_mask.any(dim=1)
+        if bool(empty_samples.any()):
+            indices = empty_samples.nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(
+                "El codificador ha rebut mostres sense cap fotograma vàlid: "
+                f"índexs de lot {indices}."
+            )
+
         x = self.input_proj(node_numeric, position_idx, context)             # [B, T, N, D]
         for block in self.blocks:
             x = block(x, adj, frame_mask)                                    # [B, T, N, D]
@@ -345,4 +353,3 @@ class SpatioTemporalEncoder(nn.Module):
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-

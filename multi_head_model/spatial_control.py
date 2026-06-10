@@ -145,7 +145,26 @@ def compute_control(
       'generators' [M,2] posicions generadores (desplaçades si dominant)
       'areas'      [M]   àrea controlada per cada jugador (m²)
     """
+    pos = np.asarray(pos, dtype=np.float64)
+    teams = np.asarray(teams, dtype=np.int64)
+    if pos.ndim != 2 or pos.shape[1] != 2 or len(pos) < 2:
+        raise ValueError(f"pos ha de tenir forma [M,2] amb M>=2; rebut {pos.shape}.")
+    if teams.shape != (len(pos),):
+        raise ValueError(
+            f"teams ha de tenir forma ({len(pos)},); rebut {teams.shape}."
+        )
+    if not np.all(np.isfinite(pos)):
+        raise ValueError("Les posicions del control d'espai contenen NaN o inf.")
+    if vel is not None:
+        vel = np.asarray(vel, dtype=np.float64)
+        if vel.shape != pos.shape:
+            raise ValueError(f"vel ha de tenir forma {pos.shape}; rebut {vel.shape}.")
+        if not np.all(np.isfinite(vel)):
+            raise ValueError("Les velocitats del control d'espai contenen NaN o inf.")
+
     gen = _generators(pos, vel, mode, t_react)
+    if not np.all(np.isfinite(gen)):
+        raise ValueError("Els generadors del control d'espai contenen NaN o inf.")
     grid, shape, cell_area, _third = build_grid(grid_res)
 
     dist = cdist(grid, gen)                            # [G, M]

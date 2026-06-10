@@ -373,6 +373,8 @@ class PhaseDataset(Dataset):
                 print(f"  [warm_cache] partit {i}/{len(self.match_dirs)}: "
                       f"{match_dir.name}")
             self._cache.get(match_dir)
+        if self._spatial_lookup is not None:
+            self._spatial_lookup.warm_cache(d.name for d in self.match_dirs)
 
     # ── helpers d'indexació ─────────────────────────────────────────────────
 
@@ -469,6 +471,8 @@ class PhaseDataset(Dataset):
             if data is None or data.get("ball") is None:
                 continue
             bx, by = float(data["ball"][0]), float(data["ball"][1])
+            if not np.all(np.isfinite([bx, by])):
+                continue
 
             # Trackeja quins slots tenen posició real en aquest frame
             valid_slots = np.zeros(N_NODES, dtype=bool)
@@ -481,6 +485,8 @@ class PhaseDataset(Dataset):
 
             # Jugadors
             for pid, (px, py, _tid) in data["players"].items():
+                if not np.all(np.isfinite([px, py])):
+                    continue
                 slot = slot_map.get(int(pid))
                 if slot is None:
                     continue
@@ -540,6 +546,15 @@ class PhaseDataset(Dataset):
 
             frame_mask[k] = True
 
+        if not frame_mask.any():
+            raise RuntimeError(
+                "Mostra sense cap fotograma vàlid: "
+                f"match={match.match_id}, phase_idx={p_idx}, "
+                f"prediction_frame={t_frame}, "
+                f"window=[{all_frames[0] if all_frames else 'buida'}, "
+                f"{all_frames[-1] if all_frames else 'buida'}]."
+            )
+
         # ── Targets ─────────────────────────────────────────────────────────
         delta_proper_frames = int(nxt["frame_start"]) - t_frame
         delta_proper_raw_s  = delta_proper_frames / FPS
@@ -579,6 +594,21 @@ class PhaseDataset(Dataset):
                 frame_k = t_frame + (k + 1) * self.stride
                 target_traj[k] = self._compute_state_final(match, slot_map, frame_k)
                 target_mask[k] = True
+
+        arrays_to_check = {
+            "node_numeric": node_numeric,
+            "context": context,
+            "adj_per_relation": adj,
+            "target_traj": target_traj,
+        }
+        for name, array in arrays_to_check.items():
+            if not np.all(np.isfinite(array)):
+                first_bad = tuple(np.argwhere(~np.isfinite(array))[0])
+                raise ValueError(
+                    f"Tensor no finit abans del model: {name}{first_bad}, "
+                    f"match={match.match_id}, phase_idx={p_idx}, "
+                    f"prediction_frame={t_frame}, valor={array[first_bad]!r}."
+                )
 
         return {
             "node_numeric":      torch.from_numpy(node_numeric),
@@ -767,9 +797,9 @@ class PhaseDataset(Dataset):
             return state
         for pid, (x, y, _tid) in data["players"].items():
             slot = slot_map.get(int(pid))
-            if slot is not None:
+            if slot is not None and np.all(np.isfinite([x, y])):
                 state[slot] = [float(x), float(y)]
         ball = data.get("ball")
-        if ball is not None:
+        if ball is not None and np.all(np.isfinite(ball[:2])):
             state[BALL_SLOT] = [float(ball[0]), float(ball[1])]
         return state

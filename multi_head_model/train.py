@@ -88,6 +88,30 @@ def aggregate(records: List[Dict[str, float]]) -> Dict[str, float]:
     return {k: sum(r[k] for r in records) / len(records) for k in keys}
 
 
+def nonfinite_summary(tensors: Dict[str, torch.Tensor]) -> List[str]:
+    """Descriu els tensors flotants que contenen NaN o infinits."""
+    problems: List[str] = []
+    for name, tensor in tensors.items():
+        if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all()):
+            continue
+        n_bad = int((~finite).sum().item())
+        finite_values = tensor[finite]
+        if finite_values.numel():
+            value_range = (
+                f"rang_finit=[{finite_values.min().item():.6g}, "
+                f"{finite_values.max().item():.6g}]"
+            )
+        else:
+            value_range = "sense_valors_finits"
+        problems.append(
+            f"{name}: {n_bad}/{tensor.numel()} no finits, {value_range}"
+        )
+    return problems
+
+
 # ── Loop d'una època ────────────────────────────────────────────────────────
 
 def run_epoch(
@@ -104,18 +128,43 @@ def run_epoch(
     loss_recs:   List[Dict[str, float]] = []
     metric_recs: List[Dict[str, float]] = []
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         batch = to_device(batch, device)
 
         with torch.set_grad_enabled(is_train):
             preds   = model(batch)
+            pred_problems = nonfinite_summary(preds)
+            if pred_problems:
+                batch_problems = nonfinite_summary(batch)
+                details = "\n  ".join(pred_problems)
+                batch_details = (
+                    "\nEntrades no finites:\n  " + "\n  ".join(batch_problems)
+                    if batch_problems else ""
+                )
+                raise FloatingPointError(
+                    f"Lot {batch_idx}: el model ha produït valors no finits "
+                    "abans de calcular "
+                    f"les pèrdues:\n  {details}{batch_details}"
+                )
             losses  = criterion(preds, batch)
+            if not bool(torch.isfinite(losses["total"])):
+                loss_values = ", ".join(
+                    f"{name}={value.item()}" for name, value in losses.items()
+                )
+                raise FloatingPointError(
+                    f"Lot {batch_idx}: pèrdua no finita: {loss_values}. "
+                    "Les prediccions i les entrades eren finites."
+                )
             metrics = compute_metrics(preds, batch)
 
         if is_train:
             optimizer.zero_grad()
             losses["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=grad_clip,
+                error_if_nonfinite=True,
+            )
             optimizer.step()
 
         loss_recs.append({k: v.item() for k, v in losses.items()})
