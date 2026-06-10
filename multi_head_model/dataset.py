@@ -59,7 +59,11 @@ from .constants import (
     T_PRED_MAX,
     DELTA_PROPER_CAP,
     MATCH_TIME_MAX_S,
+    spatial_enabled,
+    effective_node_feat,
+    effective_context_feat,
 )
+from .spatial_control_lookup import SpatialControlLookup
 from stgcn_tracking.generate_graph import MatchGraphBuilder
 
 
@@ -134,6 +138,7 @@ class _MatchData:
     def __init__(self, match_dir: Path) -> None:
         match_dir = Path(match_dir)
         match_id = match_dir.name
+        self.match_id = match_id
 
         self.builder = MatchGraphBuilder(
             tracking_path       = match_dir / f"{match_id}_tracking_extrapolated.jsonl",
@@ -214,6 +219,7 @@ class PhaseDataset(Dataset):
         min_input_frames: int = 2,
         cache_size: Optional[int] = None,
         samples_per_phase: int = 1,
+        spatial_control: Optional[str] = None,
     ) -> None:
         """
         random_t / val_t_fraction / val_t_fractions controlen com es tria
@@ -244,6 +250,17 @@ class PhaseDataset(Dataset):
         )
         self.min_input_frames   = max(1, int(min_input_frames))
         self.samples_per_phase  = max(1, int(samples_per_phase))
+
+        # Control d'espai (opcional). Si està actiu, carrega el loader dels
+        # artefactes precalculats per al mode escollit. Les dimensions
+        # efectives dels tensors s'amplien en conseqüència.
+        self.spatial_control = spatial_control if spatial_enabled(spatial_control) else None
+        self.node_feat_dim    = effective_node_feat(self.spatial_control)
+        self.context_feat_dim = effective_context_feat(self.spatial_control)
+        self._spatial_lookup = (
+            SpatialControlLookup(self.spatial_control, cache_size=len(self.match_dirs))
+            if self.spatial_control is not None else None
+        )
 
         # Mida del cache LRU. Per defecte = len(match_dirs) → tots els partits
         # en memòria després del primer accés. Per cada partit ≈ 200 MB de RAM.
@@ -427,11 +444,15 @@ class PhaseDataset(Dataset):
                 boundary = -1
 
         # ── Tensors d'entrada ───────────────────────────────────────────────
-        node_numeric = np.zeros((self.t_max, N_NODES, N_NODE_NUMERIC_FEAT), dtype=np.float32)
+        # Les amplades node/context depenen del mode de control d'espai: si
+        # està actiu, s'afegeix 1 canal de node (àrea) i 3 de context (terços).
+        node_numeric = np.zeros((self.t_max, N_NODES, self.node_feat_dim), dtype=np.float32)
         position_idx = np.full((N_NODES,), UNK_POS_IDX, dtype=np.int64)
-        context      = np.zeros((self.t_max, N_CONTEXT_FEAT), dtype=np.float32)
+        context      = np.zeros((self.t_max, self.context_feat_dim), dtype=np.float32)
         adj          = np.zeros((N_EVENT_TYPES, self.t_max, N_NODES, N_NODES), dtype=np.float32)
         frame_mask   = np.zeros((self.t_max,), dtype=bool)
+
+        mid = match.match_id   # per a la consulta de control d'espai
 
         position_idx[BALL_SLOT] = BALL_POS_IDX
 
@@ -452,6 +473,12 @@ class PhaseDataset(Dataset):
             # Trackeja quins slots tenen posició real en aquest frame
             valid_slots = np.zeros(N_NODES, dtype=bool)
 
+            # Control d'espai precalculat per a aquest frame (si està actiu)
+            sc_areas = (
+                self._spatial_lookup.areas(mid, f)
+                if self._spatial_lookup is not None else None
+            )
+
             # Jugadors
             for pid, (px, py, _tid) in data["players"].items():
                 slot = slot_map.get(int(pid))
@@ -461,24 +488,30 @@ class PhaseDataset(Dataset):
                 pxy = prev_xy[slot]
                 vx  = (px - pxy[0]) / self.dt_step_s if pxy is not None else 0.0
                 vy  = (py - pxy[1]) / self.dt_step_s if pxy is not None else 0.0
-                node_numeric[k, slot] = [
+                node_numeric[k, slot, :N_NODE_NUMERIC_FEAT] = [
                     float(px), float(py), float(vx), float(vy),
                     float(px) - bx, float(py) - by,
                     0.0, team_idx,
                 ]
+                if sc_areas is not None:
+                    node_numeric[k, slot, N_NODE_NUMERIC_FEAT] = sc_areas.get(int(pid), 0.0)
                 prev_xy[slot] = (float(px), float(py))
                 valid_slots[slot] = True
 
-            # Pilota
+            # Pilota (la pilota no és generador de la tessel·lació → àrea 0)
             pxy_b = prev_xy[BALL_SLOT]
             vbx   = (bx - pxy_b[0]) / self.dt_step_s if pxy_b is not None else 0.0
             vby   = (by - pxy_b[1]) / self.dt_step_s if pxy_b is not None else 0.0
-            node_numeric[k, BALL_SLOT] = [bx, by, float(vbx), float(vby), 0.0, 0.0, 1.0, 0.0]
+            node_numeric[k, BALL_SLOT, :N_NODE_NUMERIC_FEAT] = [
+                bx, by, float(vbx), float(vby), 0.0, 0.0, 1.0, 0.0,
+            ]
             prev_xy[BALL_SLOT] = (bx, by)
             valid_slots[BALL_SLOT] = True
 
             # Context (coherent amb la fase real del frame: curr/prev/gap)
-            context[k] = self._build_context(match, prev, curr, period, f)
+            context[k, :N_CONTEXT_FEAT] = self._build_context(match, prev, curr, period, f)
+            if self._spatial_lookup is not None:
+                context[k, N_CONTEXT_FEAT:] = self._spatial_lookup.thirds(mid, f)
 
             # Graf per relació (events del CSV)
             for ed in match.builder.build_frame_graph(f, period):

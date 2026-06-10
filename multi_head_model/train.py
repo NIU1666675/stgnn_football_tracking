@@ -157,6 +157,13 @@ def main() -> None:
                              "'ball-weighted' (per defecte): kernel gaussià "
                              "centrat a la pilota. 'attention': pooling per "
                              "atenció amb la pilota com a query.")
+    parser.add_argument("--spatial-control", type=str, default="none",
+                        choices=["none", "voronoi", "dominant"],
+                        help="Features de control d'espai (pitch control). "
+                             "'none' (per defecte): desactivat. 'voronoi': "
+                             "tessel·lació euclidiana. 'dominant': regió "
+                             "dominant amb velocitat. Requereix executar abans "
+                             "`precompute_spatial_control` per al mode triat.")
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--device",       type=str,   default="auto",
                         choices=["auto", "cpu", "cuda"])
@@ -184,23 +191,27 @@ def main() -> None:
     # Train: random_t (augmentació estocàstica). Si samples_per_phase > 1,
     # cada fase es replica N vegades amb t aleatoris independents.
     # Val / Test: multipoint val_t_fractions per cobrir horitzons diversos.
+    sc_mode = args.spatial_control if args.spatial_control != "none" else None
     train_ds = PhaseDataset(
         train_dirs,
         random_t=True,
         samples_per_phase=args.samples_per_phase,
         cache_size=args.cache_size,
+        spatial_control=sc_mode,
     )
     val_ds = PhaseDataset(
         val_dirs,
         random_t=False,
         val_t_fractions=VAL_T_FRACTIONS,
         cache_size=args.cache_size,
+        spatial_control=sc_mode,
     )
     test_ds = PhaseDataset(
         test_dirs,
         random_t=False,
         val_t_fractions=VAL_T_FRACTIONS,
         cache_size=args.cache_size,
+        spatial_control=sc_mode,
     )
     print(f"[i] Mostres: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
     print(f"[i] Train: samples_per_phase={args.samples_per_phase} → {len(train_ds)//args.samples_per_phase} fases × {args.samples_per_phase}")
@@ -225,8 +236,9 @@ def main() -> None:
     test_loader  = DataLoader(test_ds,  shuffle=False, **loader_kw)
 
     # ── Model / Optimitzador / Scheduler / Loss ───────────────────────────
-    model = MultiHeadModel(pool_type=args.pool).to(device)
+    model = MultiHeadModel(pool_type=args.pool, spatial_control=sc_mode).to(device)
     print(f"[i] Pool: {args.pool}")
+    print(f"[i] Control d'espai: {sc_mode if sc_mode else 'desactivat'}")
     print(f"[i] Paràmetres: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(

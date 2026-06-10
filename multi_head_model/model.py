@@ -29,7 +29,7 @@ Flux d'execució (forward):
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -80,11 +80,13 @@ class MultiHeadModel(nn.Module):
         self,
         ball_pool_sigma: float = SPATIAL_SIGMA,
         pool_type: str = "ball-weighted",
+        spatial_control: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.encoder = SpatioTemporalEncoder(
             ball_pool_sigma=ball_pool_sigma,
             pool_type=pool_type,
+            spatial_control=spatial_control,
         )
 
         d_cond = D_MODEL + EVENT_EMB_DIM

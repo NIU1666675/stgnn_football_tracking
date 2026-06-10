@@ -159,7 +159,41 @@ UNK_POS_IDX     = POSITION_TO_IDX["UNK"]
 # moment es parsegen els gols de dynamic_events, es pot tornar a afegir.
 N_CONTEXT_FEAT = 6 + N_PHASE_CLASSES         # 15
 
-# Total de canals d'entrada per node DESPRÉS de l'embedding de posició
+# ── Features de control d'espai (opcionals, activables per mode) ────────────
+# S'afegeixen condicionalment segons el mode de control d'espai escollit
+# ('voronoi' o 'dominant'). Quan el control està desactivat (None / 'none'),
+# les dimensions efectives són les base i el comportament és idèntic a l'original.
+#
+#   Per-node : 1 canal  → àrea de control del jugador (fracció del camp)
+#   Context  : 3 canals → control del local a cada terç (left/mid/right)
+N_SPATIAL_NODE_FEAT    = 1
+N_SPATIAL_CONTEXT_FEAT = 3
+
+SPATIAL_CONTROL_MODES = ("voronoi", "dominant")
+
+
+def spatial_enabled(mode) -> bool:
+    """True si el mode de control d'espai està actiu."""
+    return mode is not None and mode != "none"
+
+
+def effective_node_feat(mode) -> int:
+    """Canals numèrics per node segons el mode de control d'espai."""
+    return N_NODE_NUMERIC_FEAT + (N_SPATIAL_NODE_FEAT if spatial_enabled(mode) else 0)
+
+
+def effective_context_feat(mode) -> int:
+    """Canals de context segons el mode de control d'espai."""
+    return N_CONTEXT_FEAT + (N_SPATIAL_CONTEXT_FEAT if spatial_enabled(mode) else 0)
+
+
+def effective_input_dim(mode) -> int:
+    """Dimensió d'entrada de la projecció de l'encoder després de l'embedding."""
+    return effective_node_feat(mode) + POSITION_EMBED_DIM + effective_context_feat(mode)
+
+
+# Total de canals d'entrada per node DESPRÉS de l'embedding de posició,
+# en la configuració base (sense control d'espai).
 # = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT
 N_FEAT_INPUT_AFTER_EMB = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT  # 31
 

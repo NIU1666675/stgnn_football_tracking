@@ -20,15 +20,13 @@ Pipeline:
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .constants import (
-    N_NODE_NUMERIC_FEAT,
-    N_CONTEXT_FEAT,
     N_EVENT_TYPES,
     N_NODES,
     POSITION_VOCAB_SIZE,
@@ -38,6 +36,7 @@ from .constants import (
     N_LAYERS,
     DROPOUT,
     SPATIAL_SIGMA,
+    effective_input_dim,
 )
 
 
@@ -51,17 +50,21 @@ class InputProjection(nn.Module):
     """
     Combina les tres branques d'input en un únic vector per (frame, node).
 
-      node_numeric  [B, T, N, 8]
+      node_numeric  [B, T, N, F_node]   F_node = 8 (+1 si control d'espai)
       position_idx  [B, N]              → Embedding(21,8) → [B, N, 8]
-      context       [B, T, 15]          → broadcast a tots els nodes
+      context       [B, T, F_ctx]       F_ctx = 15 (+3 si control d'espai)
+                                        → broadcast a tots els nodes
 
-    Concat (8 + 8 + 15 = 31) → Linear(31, D=128) → [B, T, N, D]
+    Concat (F_node + 8 + F_ctx) → Linear(·, D=128) → [B, T, N, D]
+
+    Les dimensions efectives depenen del mode de control d'espai, que es passa
+    a la construcció perquè la projecció lineal es dimensioni correctament.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, spatial_control: Optional[str] = None) -> None:
         super().__init__()
         self.position_emb = nn.Embedding(POSITION_VOCAB_SIZE, POSITION_EMBED_DIM)
-        in_dim = N_NODE_NUMERIC_FEAT + POSITION_EMBED_DIM + N_CONTEXT_FEAT
+        in_dim = effective_input_dim(spatial_control)
         self.proj = nn.Linear(in_dim, D_MODEL)
 
     def forward(
@@ -71,9 +74,10 @@ class InputProjection(nn.Module):
         context: torch.Tensor,
     ) -> torch.Tensor:
         B, T, N, _ = node_numeric.shape
+        ctx_dim = context.shape[-1]
         pos_emb = self.position_emb(position_idx)                # [B, N, E_pos]
         pos_emb = pos_emb.unsqueeze(1).expand(B, T, N, POSITION_EMBED_DIM)
-        ctx     = context.unsqueeze(2).expand(B, T, N, N_CONTEXT_FEAT)
+        ctx     = context.unsqueeze(2).expand(B, T, N, ctx_dim)
         x = torch.cat([node_numeric, pos_emb, ctx], dim=-1)       # [B, T, N, in_dim]
         return self.proj(x)                                       # [B, T, N, D]
 
@@ -315,9 +319,10 @@ class SpatioTemporalEncoder(nn.Module):
         dropout:  float = DROPOUT,
         ball_pool_sigma: float = SPATIAL_SIGMA,
         pool_type: str = "ball-weighted",
+        spatial_control: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.input_proj = InputProjection()
+        self.input_proj = InputProjection(spatial_control=spatial_control)
         self.blocks = nn.ModuleList([
             EncoderBlock(d_model, n_heads, dropout) for _ in range(n_layers)
         ])
