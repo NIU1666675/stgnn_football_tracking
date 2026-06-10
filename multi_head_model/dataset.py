@@ -3,10 +3,11 @@ Dataset multi-head per a la predicció de fases tàctiques.
 
 Cada element correspon a una fase tàctica `curr` que té una fase posterior
 `next` dins el mateix període. L'instant de predicció `t` cau dins la fase
-actual; per defecte (`random_t=True`) es mostreja uniformement a cada crida
-(`__getitem__`), de manera que cada època veu una `t` diferent per la mateixa
-fase. Amb `random_t=False`, `t` queda deterministe a `val_t_fraction` de la
-durada de la fase (per a validació/test).
+actual; per defecte (`random_t=True`) es mostreja entre els instants amb una
+posició de pilota vàlida a cada crida (`__getitem__`), de manera que cada època
+pot veure una `t` diferent per la mateixa fase. Amb `random_t=False`, se
+selecciona l'instant vàlid més proper a `val_t_fraction` de la durada de la
+fase (per a validació/test).
 
 L'input cobreix la fase prèvia (si existeix dins el mateix període) + la fase
 actual fins a t, mostrejat amb `STRIDE`.
@@ -164,6 +165,19 @@ class _MatchData:
         self.phases = (
             self.builder.phases.sort_values(["period", "frame_start"]).reset_index(drop=True)
         )
+        valid_ball_frames = []
+        for frame, tracking in self.builder.tracking_frames.items():
+            ball = tracking.ball_data
+            if not ball or ball.get("x") is None or ball.get("y") is None:
+                continue
+            try:
+                if np.all(np.isfinite([float(ball["x"]), float(ball["y"])])):
+                    valid_ball_frames.append(int(frame))
+            except (TypeError, ValueError):
+                continue
+        self.valid_ball_frames = np.asarray(
+            sorted(valid_ball_frames), dtype=np.int64,
+        )
 
 
 # Cache LRU. Per defecte, mida 1 (només l'últim partit accedit). En entrenament
@@ -204,7 +218,7 @@ class _MatchCache:
 class PhaseDataset(Dataset):
     """
     Una mostra per fase tàctica vàlida (que tingui fase posterior dins el mateix període).
-    Punt de predicció: t = curr.frame_end - 1.
+    El punt de predicció es tria dins la fase segons la configuració de mostreig.
     """
 
     def __init__(
@@ -225,8 +239,9 @@ class PhaseDataset(Dataset):
         random_t / val_t_fraction / val_t_fractions controlen com es tria
         l'instant de predicció `t` dins de la fase actual:
 
-          - random_t=True  → uniforme aleatori a cada __getitem__
-                             (val_t_fraction(s) s'ignoren). Per entrenament.
+          - random_t=True  → aleatori entre els instants amb pilota vàlida
+                             a cada __getitem__ (val_t_fraction(s) s'ignoren).
+                             Per entrenament.
 
           - random_t=False
               · si val_t_fractions és None: `t = val_t_fraction · durada`
@@ -289,6 +304,7 @@ class PhaseDataset(Dataset):
             for p_idx in self._collect_valid_phase_indices(match_dir):
                 for frac_idx in range(n_replicas):
                     self.samples.append((m_idx, p_idx, frac_idx))
+        self._samples_filtered = False
 
     def compute_class_stats(self, verbose: bool = True) -> Dict[str, np.ndarray]:
         """
@@ -315,7 +331,7 @@ class PhaseDataset(Dataset):
             curr   = phases.iloc[p_idx]
             nxt    = phases.iloc[p_idx + 1]
 
-            t_frame = self._sample_t(curr, frac_idx)
+            t_frame = self._sample_t(match, curr, frac_idx)
             delta_proper_frames = int(nxt["frame_start"]) - t_frame
             delta_proper_raw_s  = delta_proper_frames / FPS
             is_long_pause       = delta_proper_raw_s > self.delta_proper_cap_s
@@ -373,8 +389,44 @@ class PhaseDataset(Dataset):
                 print(f"  [warm_cache] partit {i}/{len(self.match_dirs)}: "
                       f"{match_dir.name}")
             self._cache.get(match_dir)
+        self._filter_samples_without_ball(verbose=verbose)
         if self._spatial_lookup is not None:
             self._spatial_lookup.warm_cache(d.name for d in self.match_dirs)
+
+    def _filter_samples_without_ball(self, verbose: bool = True) -> None:
+        """Descarta fases sense cap instant de predicció amb pilota vàlida."""
+        if self._samples_filtered:
+            return
+
+        valid_phases = set()
+        rejected_phases = set()
+        phase_indices_by_match: Dict[int, set] = {}
+        for m_idx, p_idx, _frac_idx in self.samples:
+            phase_indices_by_match.setdefault(m_idx, set()).add(p_idx)
+
+        for m_idx, phase_indices in phase_indices_by_match.items():
+            match = self._cache.get(self.match_dirs[m_idx])
+            for p_idx in phase_indices:
+                curr = match.phases.iloc[p_idx]
+                key = (m_idx, p_idx)
+                if self._valid_prediction_frames(match, curr).size:
+                    valid_phases.add(key)
+                else:
+                    rejected_phases.add(key)
+
+        before = len(self.samples)
+        self.samples = [
+            sample for sample in self.samples
+            if (sample[0], sample[1]) in valid_phases
+        ]
+        self._samples_filtered = True
+
+        if verbose and rejected_phases:
+            print(
+                f"  [dataset] descartades {len(rejected_phases)} fases "
+                f"({before - len(self.samples)} mostres) sense cap "
+                "fotograma de pilota vàlid."
+            )
 
     # ── helpers d'indexació ─────────────────────────────────────────────────
 
@@ -417,7 +469,7 @@ class PhaseDataset(Dataset):
         period = int(curr["period"])
 
         # Instant de predicció: aleatori dins la fase (train) o deterministe (val).
-        t_frame = self._sample_t(curr, frac_idx)
+        t_frame = self._sample_t(match, curr, frac_idx)
 
         # Fase prèvia (mateix període)
         prev = None
@@ -645,57 +697,87 @@ class PhaseDataset(Dataset):
 
     # ── helpers de construcció ──────────────────────────────────────────────
 
-    def _sample_t(self, curr: pd.Series, frac_idx: int = 0) -> int:
+    def _prediction_bounds(self, curr: pd.Series) -> Tuple[int, int]:
+        """Retorna els límits inclusius permesos per a l'instant de predicció."""
+        fs = int(curr["frame_start"])
+        fe = int(curr["frame_end"])
+        t_min = fs + (self.min_input_frames - 1) * self.stride
+        t_max = fe - 1
+        if t_max < t_min:
+            fallback = max(fs, t_max)
+            return fallback, fallback
+        return t_min, t_max
+
+    def _valid_prediction_frames(
+        self,
+        match: _MatchData,
+        curr: pd.Series,
+    ) -> np.ndarray:
+        """Fotogrames admissibles de la fase amb una posició de pilota finita."""
+        t_min, t_max = self._prediction_bounds(curr)
+        frames = match.valid_ball_frames
+        lo = int(np.searchsorted(frames, t_min, side="left"))
+        hi = int(np.searchsorted(frames, t_max, side="right"))
+        return frames[lo:hi]
+
+    def _sample_t(
+        self,
+        match: _MatchData,
+        curr: pd.Series,
+        frac_idx: int = 0,
+    ) -> int:
         """
         Mostreja l'instant de predicció `t` (en frames originals) dins la fase
         actual. Garanteix com a mínim `min_input_frames` mostrejats de la fase
-        actual: t ≥ frame_start + (min_input_frames - 1) * stride.
+        actual i exigeix que la pilota tingui coordenades finites en `t`.
 
         Modes:
           - random_t=True:
-              · samples_per_phase==1 → uniforme a [t_min, t_max].
+              · samples_per_phase==1 → uniforme entre els instants vàlids.
               · samples_per_phase>1  → **mostreig estratificat**:
-                el rang es divideix en N=samples_per_phase segments iguals i
-                la còpia `frac_idx` mostreja dins del seu segment. Així:
-                  · cap còpia pot caure al mateix `t` (sense col·lisions)
-                  · les còpies cobreixen uniformement el rang
-                  · cada còpia manté aleatorietat *dins* del seu segment
+                els instants vàlids es divideixen en N segments i la còpia
+                `frac_idx` mostreja dins del seu segment.
           - random_t=False:
               · si val_t_fractions està definit → fa servir
-                `val_t_fractions[frac_idx]` (mode multipoint).
+                l'instant vàlid més proper a `val_t_fractions[frac_idx]`.
               · si no, fa servir `val_t_fraction` (un sol punt deterministe).
 
-        Si la fase és massa curta per arribar al mínim, retorna el màxim possible.
+        Si la fase és massa curta per arribar al mínim, es considera com a únic
+        candidat el màxim instant possible. Les fases sense cap candidat amb
+        pilota es descarten durant `warm_cache`.
         """
-        fs = int(curr["frame_start"])
-        fe = int(curr["frame_end"])
-        min_offset = (self.min_input_frames - 1) * self.stride
-        t_min = fs + min_offset
-        t_max = fe - 1
-
-        if t_max < t_min:
-            return max(fs, t_max)
-        if t_max == t_min:
-            return t_min
+        t_min, t_max = self._prediction_bounds(curr)
+        candidates = self._valid_prediction_frames(match, curr)
+        if not candidates.size:
+            raise RuntimeError(
+                "Fase sense cap instant de predicció amb pilota vàlida: "
+                f"match={match.match_id}, "
+                f"phase=[{int(curr['frame_start'])}, {int(curr['frame_end'])}], "
+                f"prediction_range=[{t_min}, {t_max}]."
+            )
 
         if self.random_t:
             N = self.samples_per_phase
             if N <= 1:
-                return int(np.random.default_rng().integers(t_min, t_max + 1))
-            # Mostreig estratificat: segment frac_idx-èsim dels N
-            seg_size = (t_max - t_min + 1) / N
-            seg_lo = int(round(t_min + frac_idx * seg_size))
-            seg_hi = int(round(t_min + (frac_idx + 1) * seg_size))
-            seg_hi = max(seg_lo + 1, seg_hi)         # garanteix rang no buit
-            seg_hi = min(seg_hi, t_max + 1)          # no sortim del rang
-            return int(np.random.default_rng().integers(seg_lo, seg_hi))
+                return int(np.random.default_rng().choice(candidates))
+
+            segments = np.array_split(candidates, N)
+            segment = segments[min(frac_idx, N - 1)]
+            if segment.size:
+                return int(np.random.default_rng().choice(segment))
+
+            # Pot passar si hi ha menys instants vàlids que rèpliques.
+            target_fraction = (frac_idx + 0.5) / N
+            target = t_min + target_fraction * (t_max - t_min)
+            return int(candidates[np.argmin(np.abs(candidates - target))])
 
         frac = (
             self.val_t_fractions[frac_idx]
             if self.val_t_fractions is not None
             else self.val_t_fraction
         )
-        return t_min + int(frac * (t_max - t_min))
+        target = t_min + frac * (t_max - t_min)
+        return int(candidates[np.argmin(np.abs(candidates - target))])
 
     def _build_slot_map(self, match: _MatchData, frames: List[int]) -> Dict[int, int]:
         """11 slots home (0–10) + 11 away (11–21), assignats al primer frame amb dades."""

@@ -262,10 +262,6 @@ def main() -> None:
         cache_size=args.cache_size,
         spatial_control=sc_mode,
     )
-    print(f"[i] Mostres: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
-    print(f"[i] Train: samples_per_phase={args.samples_per_phase} → {len(train_ds)//args.samples_per_phase} fases × {args.samples_per_phase}")
-    print(f"[i] Val/test t_fractions: {VAL_T_FRACTIONS}")
-
     # Pre-carrega tots els partits al cache. Així el primer batch no es queda
     # bloquejat carregant JSONL durant minuts sense feedback.
     print(f"[i] Pre-carregant partits a memòria...")
@@ -274,6 +270,13 @@ def main() -> None:
     val_ds.warm_cache()
     test_ds.warm_cache()
     print(f"[i] Cache preparada en {time.time() - t0:.1f}s")
+    print(f"[i] Mostres: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
+    print(
+        f"[i] Train: samples_per_phase={args.samples_per_phase} → "
+        f"{len(train_ds)//args.samples_per_phase} fases × "
+        f"{args.samples_per_phase}"
+    )
+    print(f"[i] Val/test t_fractions: {VAL_T_FRACTIONS}")
 
     loader_kw = dict(
         batch_size  = args.batch_size,
