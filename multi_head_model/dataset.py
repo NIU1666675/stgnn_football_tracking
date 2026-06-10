@@ -427,7 +427,12 @@ class PhaseDataset(Dataset):
                 prev = cand
 
         start_frame = int(prev["frame_start"]) if prev is not None else int(curr["frame_start"])
-        all_frames  = list(range(start_frame, t_frame + 1, self.stride))
+        # La graella temporal s'ancora a l'instant de predicció perquè el
+        # darrer element observat sigui sempre t_frame. Si s'ancora a
+        # start_frame, el darrer frame pot quedar a t_frame-1 o t_frame-2
+        # quan la longitud de la finestra no és divisible per stride.
+        all_frames = list(range(t_frame, start_frame - 1, -self.stride))
+        all_frames.reverse()
 
         # Frontera fase prèvia / actual al sampling
         boundary = -1
@@ -465,13 +470,21 @@ class PhaseDataset(Dataset):
 
         prev_xy: Dict[int, Optional[Tuple[float, float]]] = {s: None for s in range(N_NODES)}
         two_sigma_sq = 2.0 * (SPATIAL_SIGMA ** 2)
+        missing_tracking_frames = 0
+        missing_ball_frames = 0
+        nonfinite_ball_frames = 0
 
         for k, f in enumerate(all_frames):
             data = match.builder.get_frame_positions(f)
-            if data is None or data.get("ball") is None:
+            if data is None:
+                missing_tracking_frames += 1
+                continue
+            if data.get("ball") is None:
+                missing_ball_frames += 1
                 continue
             bx, by = float(data["ball"][0]), float(data["ball"][1])
             if not np.all(np.isfinite([bx, by])):
+                nonfinite_ball_frames += 1
                 continue
 
             # Trackeja quins slots tenen posició real en aquest frame
@@ -552,7 +565,11 @@ class PhaseDataset(Dataset):
                 f"match={match.match_id}, phase_idx={p_idx}, "
                 f"prediction_frame={t_frame}, "
                 f"window=[{all_frames[0] if all_frames else 'buida'}, "
-                f"{all_frames[-1] if all_frames else 'buida'}]."
+                f"{all_frames[-1] if all_frames else 'buida'}], "
+                f"sampled_frames={len(all_frames)}, "
+                f"missing_tracking={missing_tracking_frames}, "
+                f"missing_ball={missing_ball_frames}, "
+                f"nonfinite_ball={nonfinite_ball_frames}."
             )
 
         # ── Targets ─────────────────────────────────────────────────────────
