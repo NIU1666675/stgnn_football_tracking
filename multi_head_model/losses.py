@@ -203,6 +203,39 @@ def trajectory_mse_loss(
     return (per_sample * sample_mask).sum() / denom
 
 
+def trajectory_nll_loss(
+    mean: torch.Tensor,
+    log_sigma: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    norm: float = STATE_NORM,
+) -> torch.Tensor:
+    """
+    NLL gaussiana sobre la trajectòria predita, amb la mateixa estructura de
+    màscares jeràrquiques que `trajectory_mse_loss`.
+
+      mean, log_sigma, target: [B, K, N, 2]
+      target_mask:  [B, K] bool    True si el step k té target real
+      sample_mask:  [B] {0,1}      1 si la mostra no és long_pause
+
+    El residu i el log-σ s'expressen en unitats normalitzades per `norm`
+    (coherent amb la MSE). Per cada coordenada, la NLL gaussiana (sense la
+    constant 0.5·log 2π) és:
+        0.5 · r² · exp(−2·log σ) + log σ,   amb  r = (target − mean) / norm.
+    """
+    r = (target - mean) / norm                              # [B, K, N, 2]
+    nll = 0.5 * (r ** 2) * torch.exp(-2.0 * log_sigma) + log_sigma   # [B, K, N, 2]
+    per_step = nll.mean(dim=(2, 3))                         # [B, K]
+
+    mask_f = target_mask.float()
+    n_per_sample = mask_f.sum(dim=1).clamp(min=1.0)          # [B]
+    per_sample = (per_step * mask_f).sum(dim=1) / n_per_sample  # [B]
+
+    denom = sample_mask.sum().clamp(min=1.0)
+    return (per_sample * sample_mask).sum() / denom
+
+
 # ── 2. Combinador ───────────────────────────────────────────────────────────
 
 class MultiHeadLoss(nn.Module):
@@ -298,10 +331,18 @@ class MultiHeadLoss(nn.Module):
             valid_sample,
             pos_weight=self.poss_pos_weight,
         )
-        l_traj  = trajectory_mse_loss(
-            predictions["traj_pred"], batch["target_traj"],
-            batch["target_mask"], valid_sample,
-        )
+        # Trajectòria: NLL gaussiana si el cap és probabilístic (hi ha
+        # log-σ), o MSE en cas contrari. Les màscares són idèntiques.
+        if predictions.get("traj_log_sigma") is not None:
+            l_traj = trajectory_nll_loss(
+                predictions["traj_pred"], predictions["traj_log_sigma"],
+                batch["target_traj"], batch["target_mask"], valid_sample,
+            )
+        else:
+            l_traj = trajectory_mse_loss(
+                predictions["traj_pred"], batch["target_traj"],
+                batch["target_mask"], valid_sample,
+            )
 
         total = (
             self.le  * l_event

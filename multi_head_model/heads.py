@@ -17,7 +17,7 @@ A partir del vector global h ∈ R^D produït per l'encoder, la cascada és:
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,9 @@ from .constants import (
     N_TIME_MIXTURE,
     STRIDE,
     T_PRED_MAX,
+    TRAJ_LOG_SIGMA_MIN,
+    TRAJ_LOG_SIGMA_MAX,
+    TRAJ_LOG_SIGMA_INIT,
 )
 
 
@@ -255,8 +258,13 @@ class TrajectoryHead(nn.Module):
         hidden: int = 128,
         dropout: float = DROPOUT,
         temporal_kernel: int = 5,
+        probabilistic: bool = False,
     ) -> None:
         super().__init__()
+        self.probabilistic = bool(probabilistic)
+        # Sortida de la MLP: 2 canals de mitjana (Δx, Δy) i, si és
+        # probabilística, 2 més de log-σ (log σ_x, log σ_y).
+        out_dim = 4 if self.probabilistic else 2
         self.norm = nn.LayerNorm(d_in)
         self.mlp  = nn.Sequential(
             nn.Linear(d_in + 2 + 1, hidden),           # h_cond + pos + dt_k
@@ -264,11 +272,12 @@ class TrajectoryHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden // 2),
             nn.GELU(),
-            nn.Linear(hidden // 2, 2),
+            nn.Linear(hidden // 2, out_dim),
         )
         # Conv1d temporal: suavitza Δpos sobre l'eix dels steps. Cada canal
         # (x o y) es processa independent però amb mateix kernel. Padding
-        # "same" perquè la longitud K es conservi.
+        # "same" perquè la longitud K es conservi. Només actua sobre la
+        # mitjana; el log-σ no se suavitza temporalment.
         assert temporal_kernel % 2 == 1, "temporal_kernel ha de ser senar"
         self.temporal_conv = nn.Conv1d(
             in_channels=2, out_channels=2,
@@ -276,6 +285,12 @@ class TrajectoryHead(nn.Module):
             padding=temporal_kernel // 2,
         )
         self._init_temporal_conv_as_identity()
+
+        # Inicialitza el biaix del log-σ a un valor sensat (σ ≈ 5 m) perquè
+        # la NLL parteixi d'una variància raonable i no col·lapsi.
+        if self.probabilistic:
+            with torch.no_grad():
+                self.mlp[-1].bias[2:].fill_(TRAJ_LOG_SIGMA_INIT)
 
         # dt_k[k] = (k+1) * PRED_STEP_S, k ∈ {0, ..., T_PRED_MAX-1}
         dt_k = torch.arange(1, T_PRED_MAX + 1, dtype=torch.float32) * PRED_STEP_S
@@ -302,7 +317,13 @@ class TrajectoryHead(nn.Module):
         self,
         h_cond: torch.Tensor,        # [B, d_in]
         current_pos: torch.Tensor,   # [B, N, 2]
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Retorna (mean, log_sigma):
+          mean       [B, K, N, 2]   posicions absolutes predites (mitjana)
+          log_sigma  [B, K, N, 2]   log-desviació per coordenada (o None si
+                                    el cap no és probabilístic)
+        """
         B, N, _ = current_pos.shape
         K = T_PRED_MAX
         d_in = h_cond.shape[-1]
@@ -318,9 +339,10 @@ class TrajectoryHead(nn.Module):
         # feat = torch.cat([h_exp, pos_exp, dt_k_exp, delta_t_exp], dim=-1)
 
         feat = torch.cat([h_exp, pos_exp, dt_k_exp], dim=-1)                 # [B,K,N,d_in+3]
-        delta_pos = self.mlp(feat)                                            # [B, K, N, 2]
+        out  = self.mlp(feat)                                                 # [B,K,N,out_dim]
+        delta_pos = out[..., :2]                                             # [B, K, N, 2]
 
-        # ── Conv1d temporal sobre l'eix K ───────────────────────────────────
+        # ── Conv1d temporal sobre l'eix K (només la mitjana) ────────────────
         # Reorganitzem a [B*N, 2, K] perquè Conv1d treballa amb format
         # (batch, channels, length): aquí "batch" agrupa cada (mostra, node)
         # i "length" és l'eix temporal dels K steps. Així cada node és
@@ -329,7 +351,13 @@ class TrajectoryHead(nn.Module):
         d_out_conv = self.temporal_conv(d_in_conv)                            # [B*N, 2, K]
         delta_pos  = d_out_conv.view(B, N, 2, K).permute(0, 3, 1, 2)          # [B, K, N, 2]
 
-        return pos_exp + delta_pos                                            # [B, K, N, 2]
+        mean = pos_exp + delta_pos                                            # [B, K, N, 2]
+
+        if not self.probabilistic:
+            return mean, None
+
+        log_sigma = out[..., 2:].clamp(TRAJ_LOG_SIGMA_MIN, TRAJ_LOG_SIGMA_MAX)
+        return mean, log_sigma                                               # [B, K, N, 2] ×2
 
 
 # ── 6. Smoke test ───────────────────────────────────────────────────────────
@@ -356,13 +384,19 @@ if __name__ == "__main__":
 
     current_pos = torch.randn(B, N_NODES, 2) * 30.0
     # TIMEHEAD_DISABLED: la TrajectoryHead ja no rep `delta_t`.
-    traj_pred   = traj_head(h_cond, current_pos)
+    traj_pred, traj_log_sigma = traj_head(h_cond, current_pos)
+
+    prob_head = TrajectoryHead(d_cond, probabilistic=True)
+    traj_mean_p, traj_ls_p = prob_head(h_cond, current_pos)
 
     print(f"  logits      shape={tuple(logits.shape)}")
     print(f"  emb_event   shape={tuple(emb.shape)}")
     print(f"  h_cond      shape={tuple(h_cond.shape)}")
     print(f"  pause_logit shape={tuple(pause_logit.shape)}")
     print(f"  traj_pred   shape={tuple(traj_pred.shape)}    (esperat ({B}, {T_PRED_MAX}, {N_NODES}, 2))")
+    print(f"  traj_log_sigma (determinista) = {traj_log_sigma}")
+    print(f"  traj_mean_p shape={tuple(traj_mean_p.shape)}  "
+          f"traj_log_sigma_p shape={tuple(traj_ls_p.shape)}")
 
     n_params = sum(
         p.numel() for h in [event_head, event_emb, pause_head, traj_head]

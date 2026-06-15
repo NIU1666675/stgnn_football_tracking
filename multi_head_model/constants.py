@@ -49,6 +49,15 @@ DELTA_PROPER_CAP = 30.0
 # emmascarats per `target_mask` i no contribueixen a la pèrdua.
 T_PRED_MAX = 100
 
+# TrajectoryHead probabilística (opcional). Quan s'activa, el cap prediu, a
+# més de la mitjana, un log-σ per coordenada i s'entrena amb NLL gaussiana en
+# lloc de MSE. El log-σ s'expressa en unitats normalitzades per STATE_NORM i
+# es retalla a aquests límits per estabilitat numèrica de la NLL.
+#   σ_norm = exp(log_σ);  σ_metres = σ_norm · STATE_NORM
+TRAJ_LOG_SIGMA_MIN  = -7.0      # σ ≈ 0.0009 norm  (≈ 0.05 m)
+TRAJ_LOG_SIGMA_MAX  =  2.0      # σ ≈ 7.4 norm     (saturació superior)
+TRAJ_LOG_SIGMA_INIT = -2.3      # σ inicial ≈ 0.1 norm (≈ 5 m)
+
 # Nombre de components de la mixture-of-log-normals al TimeHead.
 # K=2 captura la bimodalitat curt/llarg de Δt_proper sense afegir massa
 # paràmetres. La inferència fa servir la mitjana ponderada Σπ_k·E[y_k].

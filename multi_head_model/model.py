@@ -81,6 +81,7 @@ class MultiHeadModel(nn.Module):
         ball_pool_sigma: float = SPATIAL_SIGMA,
         pool_type: str = "ball-weighted",
         spatial_control: Optional[str] = None,
+        traj_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = SpatioTemporalEncoder(
@@ -97,7 +98,7 @@ class MultiHeadModel(nn.Module):
         # self.time_head  = TimeHead(d_cond)
         self.pause_head = PauseHead(d_cond)
         self.poss_head  = PossessionChangeHead(d_cond)
-        self.traj_head  = TrajectoryHead(d_cond)
+        self.traj_head  = TrajectoryHead(d_cond, probabilistic=traj_uncertainty)
 
     def forward(
         self,
@@ -138,9 +139,11 @@ class MultiHeadModel(nn.Module):
         # ).detach()
         # traj_pred = self.traj_head(h_cond, current_pos, delta_t)
 
-        traj_pred = self.traj_head(h_cond, current_pos)            # [B, T_PRED_MAX, N, 2]
+        traj_pred, traj_log_sigma = self.traj_head(h_cond, current_pos)
+        #   traj_pred       [B, T_PRED_MAX, N, 2]  (mitjana)
+        #   traj_log_sigma  [B, T_PRED_MAX, N, 2]  o None (si no és probabilístic)
 
-        return {
+        out = {
             "event_logits":    event_logits,
             # TIMEHEAD_DISABLED:
             # "time_mix_logits": time_mix_logits,
@@ -150,6 +153,9 @@ class MultiHeadModel(nn.Module):
             "poss_logit":      poss_logit,
             "traj_pred":       traj_pred,
         }
+        if traj_log_sigma is not None:
+            out["traj_log_sigma"] = traj_log_sigma
+        return out
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
