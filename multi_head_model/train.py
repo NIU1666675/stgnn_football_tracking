@@ -213,6 +213,10 @@ def main() -> None:
                              "tessel·lació euclidiana. 'dominant': regió "
                              "dominant amb velocitat. Requereix executar abans "
                              "`precompute_spatial_control` per al mode triat.")
+    parser.add_argument("--traj-uncertainty", action="store_true",
+                        help="Fa que la TrajectoryHead predigui mitjana + "
+                             "log-σ per coordenada i s'entreni amb NLL "
+                             "gaussiana en lloc de MSE.")
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--device",       type=str,   default="auto",
                         choices=["auto", "cpu", "cuda"])
@@ -288,9 +292,13 @@ def main() -> None:
     test_loader  = DataLoader(test_ds,  shuffle=False, **loader_kw)
 
     # ── Model / Optimitzador / Scheduler / Loss ───────────────────────────
-    model = MultiHeadModel(pool_type=args.pool, spatial_control=sc_mode).to(device)
+    model = MultiHeadModel(
+        pool_type=args.pool, spatial_control=sc_mode,
+        traj_uncertainty=args.traj_uncertainty,
+    ).to(device)
     print(f"[i] Pool: {args.pool}")
     print(f"[i] Control d'espai: {sc_mode if sc_mode else 'desactivat'}")
+    print(f"[i] Trajectòria: {'NLL (mitjana+σ)' if args.traj_uncertainty else 'MSE (determinista)'}")
     print(f"[i] Paràmetres: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(
